@@ -1,0 +1,33 @@
+# Local credentials and machine-specific MCP configuration
+.env
+.env.*
+!.env.example
+/mcp.json
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Agent runtime state and local backups
+/tasks/
+/.memory/
+/.transcripts/
+/.task_outputs/
+/.code-backups/
+*.log
+
+# Local editor settings
+/.cursor/
+/.vscode/
+/.idea/
