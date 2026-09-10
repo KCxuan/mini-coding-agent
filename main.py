@@ -52,6 +52,8 @@ SUB_SYSTEM_PROMPT = (
     "in the given prompt. "
     "You may use only read_file, glob, and load_skill. "
     "glob matches file paths; it does not search file contents. "
+    "read_file returns numbered pages. Use the returned next offset to "
+    "continue reading; do not repeatedly increase limit from the beginning. "
     "Use relative glob patterns without parent-directory traversal. "
     "Do not create, claim, or complete tasks. "
     "You cannot modify files, run shell commands, execute scripts, "
@@ -99,16 +101,28 @@ BASE_TOOLS = [
     },
     {
         "name": "read_file",
-        "description": "Read a file",
+        "description": (
+            "Read a numbered page of a UTF-8 file. offset is the 1-based "
+            "starting line (default 1). limit defaults to 200 and is capped "
+            "at 200 lines. Use the returned next offset for the next page."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                 },
-                "limit":{
+                "limit": {
                     "type": "integer",
-                }
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 200,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "default": 1,
+                },
             },
             "required": ["path"]
         }
@@ -1303,6 +1317,7 @@ class SubagentState:
     status: str = "running"
     turns_used: int = 0
     messages: list[dict] = field(default_factory=list)
+    response_log: list[dict] = field(default_factory=list)
 
     # 最终交接
     summary: str = ""
@@ -1358,11 +1373,32 @@ def subagent_evidence(
 
     return evidence
 
+def record_subagent_response(state, response, *, phase: str, max_tokens: int) -> None:
+    """记录接口返回的事实，不记录或打印推理内容。"""
+    usage = getattr(response, "usage", None)
+    record = {
+        "phase": phase,
+        "turn": state.turns_used,
+        "stop_reason": getattr(response, "stop_reason", None),
+        "content_types": [
+            getattr(block, "type", None) for block in response.content
+        ],
+        "max_tokens": max_tokens,
+        "output_tokens": getattr(usage, "output_tokens", None),
+    }
+    state.response_log.append(record)
+    print(f"[{state.run_id}] response: {json.dumps(record, ensure_ascii=False)}")
+
+
 def apply_subagent_summary(
     state: SubagentState,
     text: str,
 ) -> None:
     """解析格式正确的摘要，格式不符合要求时保留原文，不因为解析失败丢掉回答。"""
+    if not text.strip():
+        state.warnings.append("收尾模型没有返回文本，保留程序生成的摘要和未完成说明。")
+        return
+
     try:
         data = json.loads(text)
 
@@ -1461,6 +1497,7 @@ def execute_subagent(
                 tools=SUB_TOOLS,
                 max_tokens=8192,
             )
+            record_subagent_response(state, response, phase="work", max_tokens=8192)
 
             # 将 SDK 对象转为普通字典，
             # 便于后面提取证据和生成总结。
@@ -1475,6 +1512,13 @@ def execute_subagent(
             # 模型返回时可能已经超过预算，
             # 此时不能继续启动新工具。
             remaining_seconds()
+
+            # 输出被截断时，不能把部分文本当作完成，
+            # 也不能执行这一响应中可能不完整的工具请求。
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                reason = "budget_exhausted"
+                state.error = "模型达到单次输出 token 上限，响应未完整结束。"
+                break
 
             tool_calls = [
                 block
@@ -1505,7 +1549,9 @@ def execute_subagent(
                     reason = "failed"
                     state.error = (
                         "模型没有返回工具调用，"
-                        "也没有返回最终文本"
+                        "也没有返回最终文本；"
+                        f"stop_reason={getattr(response, 'stop_reason', None)!r}，"
+                        f"content_types={state.response_log[-1]['content_types']}"
                     )
 
                 break
@@ -1632,6 +1678,9 @@ def finalize_subagent(
             }],
         )
 
+        record_subagent_response(state, response, phase="summary", max_tokens=1500)
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            raise ValueError("收尾响应达到输出 token 上限，保留程序生成的基本交接。")
         apply_subagent_summary(
             state,
             extract_text(response.content),
@@ -1828,6 +1877,7 @@ def format_subagent_result(
             "error": state.error,
             "warnings": state.warnings,
             "turns_used": state.turns_used,
+            "response_log": state.response_log,
             "evidence": evidence,
         },
         ensure_ascii=False,
@@ -1874,16 +1924,39 @@ def safe_path(p: str) -> str:
     return path
 
 # 定义阅读文档的工具执行函数(read_file)
-def run_read_file(path: str, limit: int | None = None) -> str:
+def run_read_file(
+    path: str,
+    limit: int | None = 200,
+    offset: int = 1,
+) -> str:
+    """按 1-based 起始行分页；保留第二个位置参数 limit 的兼容性。"""
     try:
+        if type(offset) is not int or offset < 1:
+            raise ValueError("offset 必须是大于零的整数（起始行号）")
+        if limit is None:
+            limit = 200
+        if type(limit) is not int or limit < 1:
+            raise ValueError("limit 必须是大于零的整数")
+
         lines = safe_path(path).read_text(encoding="utf-8").splitlines()
-        if limit and limit < len(lines):
-            truncated = lines[:limit]
-            truncated.append(f"... {len(lines) - limit} more lines")
-            return "\n".join(truncated)
-        return "\n".join(lines)
-    except ValueError as e:
-        return str(e)
+        total = len(lines)
+        if offset > total:
+            return f"File: {path}\n[EOF] Total lines: {total}; requested offset: {offset}"
+
+        end = min(offset - 1 + min(limit, 200), total)
+        page = [
+            f"{number}: {lines[number - 1]}"
+            for number in range(offset, end + 1)
+        ]
+        footer = f"Next offset: {end + 1}" if end < total else "[EOF]"
+        return "\n".join([
+            f"File: {path}",
+            f"Lines {offset}-{end} of {total}",
+            *page,
+            footer,
+        ])
+    except (ValueError, OSError) as exc:
+        return f"Error: {exc}"
 
 # 定义写入文档的工具执行函数(write_file)
 def run_write_file(path: str, content: str) -> str:
@@ -3085,7 +3158,7 @@ TOOL_HANDLERS = {
 # ------------此部分为compact的相关实现代码 --------------
 
 class ContextCompactor:
-    CONTEXT_CHAR_LIMIT = 50000 # 上下文字符限制
+    CONTEXT_CHAR_LIMIT = 200000 # 上下文字符限制
     TOOL_RESULT_BATCH_CHAR_LIMIT = 200000 # 工具结果批量字符限制
     LARGE_RESULT_CHAR_LIMIT = 30000 # 大型结果字符限制
     SUMMARY_INPUT_CHAR_LIMIT = 80000 # 总结输入字符限制
@@ -3555,7 +3628,8 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             #trigger_hooks("PreToolUse", tool_call)
             #tool_result = TOOL_HANDLERS[tool_call.name](**tool_call.input)
             tool_result = execute_tool(tool_call, handlers)
-            print(f"Tool result: {tool_result[:10000]}...")
+            suffix = "... [terminal preview truncated]" if len(tool_result) > 500 else ""
+            print(f"Tool result: {tool_result[:500]}{suffix}")
             results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,

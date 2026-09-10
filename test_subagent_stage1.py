@@ -1,11 +1,11 @@
-"""第一阶段 subagent 的离线回归测试（只依赖 Python 标准库）。
+"""Subagent 离线回归测试（保留第一阶段入口，覆盖当前只读子循环）。
 
 运行：
     python -B test_subagent_stage1.py
     python -B test_subagent_stage1.py SubagentStageOneTests.test_turn_budget
 
 测试当前 main.py 中的真实子循环、收尾、证据提取和工具分发代码，
-但模型、文件工具、任务读取和 shell 进程均使用模拟对象。
+模型、任务读取和 shell 进程使用模拟对象；分页读取测试只使用临时文件。
 不读取 .env、不调用 API、不运行命令、不修改看板或业务文件。
 
 使用 AST 只加载指定定义，避免 import main 导致客户端初始化等副作用。
@@ -23,6 +23,7 @@ import sys
 import threading
 import types
 import unittest
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import Mock
@@ -34,8 +35,14 @@ DEFINITIONS = {
     "SubagentState", "subagent_evidence", "apply_subagent_summary",
     "execute_subagent", "finalize_subagent", "run_subagent",
     "execute_tool", "extract_text", "trigger_hooks", "_run_bash_process",
+    "record_subagent_response", "execute_subagent_tool",
+    "SubagentManager", "format_subagent_result", "safe_path",
+    "run_read_file", "run_glob", "run_subagent_glob",
 }
-CONSTANTS = {"SUB_SYSTEM_PROMPT", "SUB_TOOLS", "TASK_TOOL"}
+CONSTANTS = {
+    "SUB_SYSTEM_PROMPT", "SUB_TOOLS", "TASK_TOOL",
+    "BASE_TOOLS", "SUB_READONLY_TOOL_NAMES",
+}
 
 
 class FakeClock:
@@ -144,6 +151,8 @@ def load_runtime(clock, client):
         "uuid4": uuid4, "json": json, "time": clock,
         "WORKDIR": SOURCE.parent, "MODEL": "offline-fake-model",
         "client": client,
+        "threading": threading,
+        "SKILL_LOADER": types.SimpleNamespace(load=unexpected_operation),
         "anthropic": types.SimpleNamespace(APITimeoutError=FakeAPITimeoutError),
         "HOOKS": {name: [] for name in ("PreToolUse", "PostToolUse", "Stop")},
         "BASE_TOOL_HANDLERS": {
@@ -173,6 +182,9 @@ def load_runtime(clock, client):
     )
     isolated = ast.fix_missing_locations(ast.Module(body=[future, *selected], type_ignores=[]))
     exec(compile(isolated, str(SOURCE), "exec"), module.__dict__)
+    module.real_read_file = module.run_read_file
+    module.run_read_file = read_file
+    module.SUBAGENTS = module.SubagentManager()
     return module, read_file, process
 
 
@@ -222,7 +234,7 @@ class SubagentStageOneTests(unittest.TestCase):
         self.assertIn("example file content", self.client.requests[-1]["request"]["messages"][0]["content"])
 
     def test_tool_error_then_recovery(self):
-        """工具报错后，真实 execute_tool 把错误交回模型，允许继续。"""
+        """工具报错后，真实 execute_subagent_tool 把错误交回模型，允许继续。"""
         self.read_file.side_effect = [FileNotFoundError("missing file"), "recovered"]
         self.client.work = [
             tool_response(tool_call(path="missing.py")),
@@ -293,47 +305,43 @@ class SubagentStageOneTests(unittest.TestCase):
         self.assertEqual(self.evidence(result)[0]["output"], "first result survives")
         self.assertEqual(len(self.evidence(result)), 1)
 
-    def test_budget_rechecked_after_permission_hook(self):
-        """权限检查消耗了时间后，包装函数必须阻止真实工具启动。"""
-        def delayed_permission(block):
-            self.clock.advance(601)
-        self.agent.HOOKS["PreToolUse"].append(delayed_permission)
-        self.client.work = [tool_response(tool_call(path="must_not_run.py"))]
+    def test_readonly_tools_do_not_enter_permission_hooks(self):
+        """只读入口无需询问，主 Agent 的审批钩子不会被子 Agent 调用。"""
+        permission = Mock(side_effect=AssertionError("must not ask"))
+        self.agent.HOOKS["PreToolUse"].append(permission)
+        self.client.work = [
+            tool_response(tool_call(path="example.py")), final_response()
+        ]
         result = self.run_state()
-        self.assertEqual(result.status, "timed_out")
-        self.read_file.assert_not_called()
+        self.assertEqual(result.status, "completed")
+        permission.assert_not_called()
+        self.read_file.assert_called_once()
 
-    def test_shell_timeout_budget_and_cleanup_request(self):
-        """模拟进程超时，检查剩余时间传递、清理调用及结果保留。"""
-        def timeout_process(**kwargs):
-            self.clock.advance(kwargs["timeout"])
-            raise subprocess.TimeoutExpired("fake command", kwargs["timeout"])
-        self.process.communicate.side_effect = timeout_process
-        self.client.work = [tool_response(tool_call("bash", command="fake command"))]
-        result = self.run_state(timeout_seconds=3)
-        self.assertEqual(result.status, "timed_out")
+    def test_main_shell_timeout_still_requests_cleanup(self):
+        """子 Agent 禁用 shell 后，主 Agent 的原始进程超时清理仍保留。"""
+        self.process.communicate.side_effect = subprocess.TimeoutExpired("fake", 3)
+        output, code = self.agent._run_bash_process("fake", timeout=3)
+        self.assertIsNone(code)
+        self.assertIn("timed out", output)
         self.process.communicate.assert_called_once_with(timeout=3)
         self.agent._stop_process_group.assert_called_once_with(self.process)
-        self.process.wait.assert_called_once()
         self.assertFalse(self.agent._shell_processes)
-        evidence = self.evidence(result)[0]
-        self.assertIsNone(evidence["exit_code"])
-        self.assertIn("timed out", evidence["output"])
-        self.assert_summary_request()
 
-    def test_shell_exit_code_in_external_json(self):
-        """从模拟 Popen 到主 Agent 的 JSON，非零退出码没有丢失。"""
-        self.process.returncode = 7
-        self.process.communicate.return_value = ("EXPECTED_FAILURE", "")
-        self.client.work = [
-            tool_response(tool_call("bash", command="fake command")), final_response()
-        ]
-        payload = json.loads(self.agent.run_subagent("task_12345678", "check exit code"))
+    def test_subagent_rejects_mutating_tools_and_keeps_evidence(self):
+        """即使模型请求了未公布的工具，也不允许执行或启动 shell。"""
+        self.client.work = [tool_response(
+            tool_call("bash", command="must not run"),
+            tool_call("write_file", call_id="call_2", path="x", content="x"),
+            tool_call("edit_file", call_id="call_3", path="x",
+                      old_content="x", new_content="y"),
+        ), final_response()]
+        payload = json.loads(self.agent.format_subagent_result(self.run_state()))
         self.assertEqual(payload["status"], "completed")
-        self.assertEqual(payload["task_id"], "task_12345678")
-        self.assertTrue(payload["run_id"].startswith("run_"))
-        self.assertEqual(payload["evidence"][0]["exit_code"], 7)
-        self.assertIn("EXPECTED_FAILURE", payload["evidence"][0]["output"]["text"])
+        self.assertEqual(len(payload["evidence"]), 3)
+        for item in payload["evidence"]:
+            self.assertTrue(item["output"]["text"].startswith("Error:"))
+            self.assertNotIn("exit_code", item)
+        self.agent.subprocess.Popen.assert_not_called()
 
     def test_invalid_summary_format_preserves_text(self):
         """模型没有遵守纯 JSON 格式时，原始回答仍能交接。"""
@@ -361,12 +369,165 @@ class SubagentStageOneTests(unittest.TestCase):
         self.client.work = [tool_response(*[
             tool_call(call_id=f"call_{i}", path=f"file_{i}.py") for i in range(10)
         ]), final_response()]
-        payload = json.loads(self.agent.run_subagent("task_12345678", "test previews"))
+        result = self.run_state()
+        payload = json.loads(self.agent.format_subagent_result(result))
         self.assertEqual(len(payload["evidence"]), 10)
         for record in payload["evidence"]:
             self.assertTrue(record["output"]["truncated"])
             self.assertEqual(len(record["output"]["text"]), 1200)
         self.assertNotIn("record_path", payload)
+
+
+    def test_thinking_only_response_reports_failure_without_retry(self):
+        self.client.work = [types.SimpleNamespace(
+            content=[FakeBlock("thinking", thinking="not a final answer")],
+            stop_reason="end_turn",
+            usage=types.SimpleNamespace(output_tokens=42),
+        )]
+        result = self.run_state()
+        self.assertEqual(result.status, "failed")
+        self.assertIn("thinking", result.error)
+        self.assertEqual(result.turns_used, 1)
+        record = result.response_log[0]
+        self.assertEqual(record["stop_reason"], "end_turn")
+        self.assertEqual(record["content_types"], ["thinking"])
+        self.assertEqual(record["output_tokens"], 42)
+        self.assertNotIn("not a final answer", json.dumps(record))
+        self.assertEqual(len(self.client.requests), 2)  # 工作一次，收尾一次
+        self.assertEqual(result.response_log[-1]["phase"], "summary")
+
+    def test_output_exhaustion_never_completes_or_executes_partial_tools(self):
+        for content in (
+            [FakeBlock("text", text='{"summary":"looks done","remaining":""}')],
+            [tool_call(path="must_not_run.py")],
+        ):
+            with self.subTest(content=content):
+                self.client.work = [types.SimpleNamespace(
+                    content=content, stop_reason="max_tokens",
+                    usage=types.SimpleNamespace(output_tokens=8192),
+                )]
+                self.client.summary = [final_response("partial", "unfinished")]
+                result = self.run_state()
+                self.assertEqual(result.status, "budget_exhausted")
+                self.assertTrue(result.error)
+                self.read_file.assert_not_called()
+                self.assertEqual(self.evidence(result), [])
+
+    def test_empty_summary_preserves_program_fallback(self):
+        self.client.work = [tool_response(tool_call(path="example.py"))]
+        self.client.summary = [types.SimpleNamespace(
+            content=[], stop_reason="end_turn",
+            usage=types.SimpleNamespace(output_tokens=0),
+        )]
+        result = self.run_state(max_turns=1)
+        self.assertEqual(result.status, "budget_exhausted")
+        self.assertIn("budget_exhausted", result.summary)
+        self.assertTrue(result.remaining)
+        self.assertTrue(result.warnings)
+        self.assertEqual(result.response_log[-1]["content_types"], [])
+        self.assertEqual(result.response_log[-1]["output_tokens"], 0)
+
+    def test_truncated_summary_does_not_replace_fallback(self):
+        self.client.work = [tool_response(tool_call(path="example.py"))]
+        response = final_response("not reliable", "")
+        response.stop_reason = "max_tokens"
+        self.client.summary = [response]
+        result = self.run_state(max_turns=1)
+        self.assertNotEqual(result.summary, "not reliable")
+        self.assertTrue(result.remaining)
+        self.assertTrue(result.warnings)
+
+    def test_paged_read_arguments_reach_the_tool_and_evidence(self):
+        self.client.work = [
+            tool_response(tool_call(path="main.py", offset=1600, limit=120)),
+            final_response(),
+        ]
+        result = self.run_state()
+        self.read_file.assert_called_once_with(
+            path="main.py", offset=1600, limit=120
+        )
+        self.assertEqual(self.evidence(result)[0]["arguments"]["offset"], 1600)
+
+    def test_manager_publishes_failure_and_keeps_query_after_collect(self):
+        self.client.work = [types.SimpleNamespace(content=[], stop_reason="end_turn")]
+        state = self.state()
+        manager = self.agent.SUBAGENTS
+        manager.running[state.run_id] = threading.current_thread()
+        self.assertEqual(manager.get(state.run_id)["status"], "running")
+        manager._run(state)
+        first = manager.get(state.run_id)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(first["response_log"][0]["content_types"], [])
+        first["response_log"].clear()
+        self.assertTrue(state.response_log)
+        self.assertEqual(manager.collect(), [state])
+        self.assertEqual(manager.collect(), [])
+        self.assertEqual(manager.get(state.run_id)["status"], "failed")
+
+
+class ReadFilePaginationTests(unittest.TestCase):
+    def setUp(self):
+        self.agent, _, _ = load_runtime(FakeClock(), FakeClient())
+        self.temp = tempfile.TemporaryDirectory(prefix="agent-read-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.agent.WORKDIR = self.root
+        self.lines = [f"source line {i}" for i in range(1, 506)]
+        (self.root / "large.py").write_text("\n".join(self.lines), encoding="utf-8")
+
+    def test_every_page_has_correct_lines_and_next_offset(self):
+        seen = []
+        for offset, last in ((1, 200), (201, 400), (401, 505)):
+            output = self.agent.real_read_file("large.py", offset=offset)
+            self.assertIn(f"Lines {offset}-{last} of 505", output)
+            numbered = output.splitlines()[2:-1]
+            self.assertEqual(numbered[0], f"{offset}: source line {offset}")
+            self.assertEqual(numbered[-1], f"{last}: source line {last}")
+            seen.extend(numbered)
+            self.assertTrue(output.endswith(
+                f"Next offset: {last + 1}" if last < 505 else "[EOF]"
+            ))
+        self.assertEqual(seen, [
+            f"{i}: source line {i}" for i in range(1, 506)
+        ])
+
+    def test_targeted_page_and_legacy_positional_limit(self):
+        output = self.agent.real_read_file("large.py", 3, offset=350)
+        self.assertIn("Lines 350-352 of 505", output)
+        self.assertIn("350: source line 350", output)
+        self.assertNotIn("1: source line 1\n", output)
+        self.assertTrue(output.endswith("Next offset: 353"))
+
+    def test_large_limit_and_none_still_return_bounded_pages(self):
+        for limit in (None, 3600):
+            with self.subTest(limit=limit):
+                output = self.agent.real_read_file("large.py", limit=limit)
+                self.assertIn("Lines 1-200 of 505", output)
+                self.assertTrue(output.endswith("Next offset: 201"))
+
+    def test_eof_empty_file_and_invalid_arguments(self):
+        self.assertIn("[EOF]", self.agent.real_read_file("large.py", offset=506))
+        (self.root / "empty.py").write_text("", encoding="utf-8")
+        self.assertIn("Total lines: 0", self.agent.real_read_file("empty.py"))
+        for args in ({"offset": 0}, {"offset": True}, {"offset": 1.5},
+                     {"limit": 0}, {"limit": -1}, {"limit": "3"}):
+            with self.subTest(args=args):
+                self.assertTrue(self.agent.real_read_file(
+                    "large.py", **args
+                ).startswith("Error:"))
+
+    def test_workspace_escape_and_missing_file_are_errors(self):
+        self.assertIn("escapes", self.agent.real_read_file("../outside.py"))
+        self.assertTrue(self.agent.real_read_file("missing.py").startswith("Error:"))
+
+    def test_tool_schema_advertises_pagination_for_both_agents(self):
+        main_tool = next(t for t in self.agent.BASE_TOOLS if t["name"] == "read_file")
+        sub_tool = next(t for t in self.agent.SUB_TOOLS if t["name"] == "read_file")
+        self.assertEqual(main_tool, sub_tool)
+        self.assertIn("offset", sub_tool["input_schema"]["properties"])
+        self.assertEqual({t["name"] for t in self.agent.SUB_TOOLS},
+                         {"read_file", "glob", "load_skill"})
+
 
 
 if __name__ == "__main__":
