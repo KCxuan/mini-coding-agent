@@ -38,10 +38,14 @@ DEFINITIONS = {
     "record_subagent_response", "execute_subagent_tool",
     "SubagentManager", "format_subagent_result", "safe_path",
     "run_read_file", "run_glob", "run_subagent_glob",
+    "SubagentCancelled", "check_subagent_cancelled",
+    "finalize_cancelled_subagent", "inject_subagent_results",
+    "run_subagent_cancel",
 }
 CONSTANTS = {
     "SUB_SYSTEM_PROMPT", "SUB_TOOLS", "TASK_TOOL",
     "BASE_TOOLS", "SUB_READONLY_TOOL_NAMES",
+    "SUBAGENT_CANCEL_TOOL",
 }
 
 

@@ -313,9 +313,31 @@ SUBAGENT_STATUS_TOOL = {
     "name": "subagent_status",
     "description": (
         "Query one subagent run by run_id. "
-        "Returns running, its final result, or not_found. "
+        "Returns running, cancelling, its final result, or not_found. "
         "Query only when needed; final results arrive automatically. "
         "This does not consume the automatic completion notification."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "run_id": {
+                "type": "string",
+                "description": "The run_id returned by the task tool.",
+            },
+        },
+        "required": ["run_id"],
+        "additionalProperties": False,
+    },
+}
+
+SUBAGENT_CANCEL_TOOL = {
+    "name": "subagent_cancel",
+    "description": (
+        "Request cancellation of one subagent run by run_id. "
+        "A cancelling receipt means cancellation is pending. "
+        "An operation already in progress may finish or time out "
+        "before the final cancelled result arrives automatically. "
+        "Already finished runs keep their original results."
     ),
     "input_schema": {
         "type": "object",
@@ -341,7 +363,7 @@ SUB_TOOLS = [
     if tool["name"] in SUB_READONLY_TOOL_NAMES
 ]
 
-TOOLS = [*BASE_TOOLS, TASK_TOOL, *TASK_BOARD_TOOLS, COMPACT_TOOL, SUBAGENT_STATUS_TOOL]
+TOOLS = [*BASE_TOOLS, TASK_TOOL, *TASK_BOARD_TOOLS, COMPACT_TOOL, SUBAGENT_STATUS_TOOL, SUBAGENT_CANCEL_TOOL]
 
 DENY_LIST = [
     "rm -rf /", "sudo", "shutdown", "reboot",
@@ -676,11 +698,27 @@ def _format_bash_output(output: str, exit_code: int | None) -> str:
         return output
     return f"Error: Command exited with code {exit_code}\n{output}"
 
+"""
 def _handle_termination_signal(signum, _frame):
-    """处理终止信号"""
     print(f"  [background] received signal {signum}, terminating all shell processes")
     _stop_all_shell_processes()
     raise SystemExit(128 + signum)
+"""
+
+# 防止重复 Ctrl+C 打断正在进行的清理。
+_exit_requested = False
+_cleanup_started = False
+
+def _handle_termination_signal(signum, _frame):
+    """只发起退出，不在信号处理函数中执行资源清理。"""
+    global _exit_requested
+
+    if _exit_requested or _cleanup_started:
+        return
+
+    _exit_requested = True
+    raise SystemExit(128 + signum)
+
 
 atexit.register(_stop_all_shell_processes)
 if _IS_WINDOWS:
@@ -1318,12 +1356,61 @@ class SubagentState:
     turns_used: int = 0
     messages: list[dict] = field(default_factory=list)
     response_log: list[dict] = field(default_factory=list)
+    # 每次运行有自己的取消信号，取消 A 不会影响 B。
+    cancel_event: threading.Event = field(
+        default_factory=threading.Event,
+        repr=False,
+        compare=False,
+    )
 
     # 最终交接
     summary: str = ""
     remaining: str = ""
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+
+class SubagentCancelled(Exception):
+    """通过异常退出当前子循环，不代表工具执行失败。"""
+
+
+def check_subagent_cancelled(state: SubagentState) -> None:
+    if state.cancel_event.is_set():
+        raise SubagentCancelled("收到取消请求")
+
+
+def finalize_cancelled_subagent(
+    state: SubagentState,
+) -> SubagentState:
+    """取消时只整理已有记录，不再请求模型或执行工具。"""
+    if state.status == "cancelled":
+        return state
+
+    previous_summary = state.summary
+    previous_remaining = state.remaining
+
+    state.status = "cancelled"
+    state.summary = (
+        f"本次运行已取消；"
+        f"已请求工作模型 {state.turns_used} 轮，"
+        f"记录工具结果 {len(subagent_evidence(state))} 条。"
+    )
+
+    if previous_summary:
+        state.summary += f"\n取消前已有摘要：{previous_summary}"
+
+    state.remaining = (
+        "本次运行因取消而结束，不能据此认定原任务完成。"
+        "请主 Agent 根据已有证据决定后续处理。"
+    )
+
+    if previous_remaining:
+        state.remaining += (
+            f"\n取消前记录的未完成事项：{previous_remaining}"
+        )
+
+    # messages、response_log 和 error 都保留。
+    return state
+
 
 def subagent_evidence(
     state: SubagentState,
@@ -1456,9 +1543,9 @@ def execute_subagent(
     final_text = ""
 
     def remaining_seconds() -> float:
-        """
-        计算剩余时间，如果剩余时间小于0，则抛出TimeoutError。
-        """
+        # 优先响应取消请求。
+        check_subagent_cancelled(state)
+
         seconds = deadline - time.monotonic()
 
         if seconds <= 0:
@@ -1588,6 +1675,9 @@ def execute_subagent(
                 # 先记录工具结果，再处理时间耗尽。
                 remaining_seconds()
 
+    except SubagentCancelled:
+        reason = "cancelled"
+
     except (
         TimeoutError,
         anthropic.APITimeoutError,
@@ -1615,6 +1705,9 @@ def finalize_subagent(
     reason: str,
     final_text: str = "",
 ) -> SubagentState:
+    if reason == "cancelled" or state.cancel_event.is_set():
+        return finalize_cancelled_subagent(state)
+
     state.status = reason
 
     # 先准备一份不依赖模型的基本交接。
@@ -1629,9 +1722,11 @@ def finalize_subagent(
     )
 
     if final_text:
-        # 正常结束时直接使用最后回答，
-        # 不多请求一次模型。
         apply_subagent_summary(state, final_text)
+
+        if state.cancel_event.is_set():
+            return finalize_cancelled_subagent(state)
+
         return state
 
     # 中断时，新建一次不带工具的总结请求。
@@ -1651,6 +1746,8 @@ def finalize_subagent(
         )
 
     try:
+        check_subagent_cancelled(state)
+
         response = client.with_options(
             timeout=state.summary_timeout_seconds,
             max_retries=0,
@@ -1686,10 +1783,15 @@ def finalize_subagent(
             extract_text(response.content),
         )
 
+    except SubagentCancelled:
+        return finalize_cancelled_subagent(state)
+
     except Exception as exc:
         state.warnings.append(
             f"收尾总结失败，返回程序生成的基本交接：{exc}"
         )
+    if state.cancel_event.is_set():
+        return finalize_cancelled_subagent(state)
 
     return state
 
@@ -1712,6 +1814,12 @@ class SubagentManager:
         self.ready: list[str] = []
 
         self._lock = threading.Lock()
+
+        # 每个运行有自己的取消信号，取消 A 不会影响 B。
+        self.cancel_events: dict[str, threading.Event] = {}
+
+        # 一旦开始关闭，就不再接受新运行。
+        self._closing = False
 
     def start(self, task_id: str, prompt: str) -> str:
         task = load_task(task_id)
@@ -1741,6 +1849,10 @@ class SubagentManager:
 
         # 检查名额与登记必须在同一个锁内完成。
         with self._lock:
+            if self._closing:
+                raise RuntimeError(
+                    "已开始关闭，不再接受新运行"
+                )
             if len(self.running) >= self.max_workers:
                 raise RuntimeError(
                     "并发名额已满，"
@@ -1748,17 +1860,91 @@ class SubagentManager:
                 )
 
             self.running[state.run_id] = thread
+            self.cancel_events[state.run_id] = state.cancel_event
 
-        try:
-            thread.start()
+            try:
+                thread.start()
 
-        except Exception:
-            # 线程启动失败时，归还刚占用的名额。
-            with self._lock:
+            except Exception:
                 self.running.pop(state.run_id, None)
-            raise
+                self.cancel_events.pop(state.run_id, None)
+                raise
 
         return state.run_id
+
+    def cancel(self, run_id: str) -> dict:
+        """发出取消请求，不直接修改执行中的 state。"""
+        with self._lock:
+            # 已经发布的结果不会被事后改成 cancelled。
+            finished = self.results.get(run_id)
+
+            if finished is not None:
+                return {
+                    "run_id": run_id,
+                    "status": finished.status,
+                    "message": "这次运行已经结束，保持原结果。",
+                }
+
+            event = self.cancel_events.get(run_id)
+
+            if event is None:
+                return {
+                    "run_id": run_id,
+                    "status": "not_found",
+                    "error": "当前进程中没有这次运行，请检查 run_id。",
+                }
+
+            event.set()
+
+            return {
+                "run_id": run_id,
+                "status": "cancelling",
+                "message": (
+                    "已请求取消。当前操作返回或超时后停止后续步骤，"
+                    "最终结果将自动交接。"
+                ),
+            }
+
+    def shutdown(self, timeout_seconds: float = 5.0,) -> list[str]:
+        """
+        停止接收新运行，通知所有子 Agent 取消，并限时等待。
+
+        返回等待结束时仍未发布结果的 run_id。
+        不强制终止线程，也不伪造 cancelled 结果。
+        """
+        if timeout_seconds < 0:
+            raise ValueError("等待时间不能小于零")
+
+        deadline = time.monotonic() + timeout_seconds
+
+        # 锁内：关门、通知取消、复制等待名单。
+        with self._lock:
+            self._closing = True
+
+            for event in self.cancel_events.values():
+                event.set()
+
+            threads = list(self.running.values())
+
+        # 锁外：让子线程能够拿锁并发布结果。
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+
+            if remaining <= 0:
+                break
+
+            try:
+                # 等待子线程结束
+                thread.join(timeout=remaining)
+
+            except RuntimeError:
+                # Ctrl+C 极端情况下可能打断线程启动过程。
+                # 尚未启动的线程不能 join。
+                # 保留登记，稍后如实报告未完成交接。
+                continue
+
+        with self._lock:
+            return list(self.running)
 
     def _run(self, state: SubagentState) -> None:
         # 不持锁执行。
@@ -1785,9 +1971,13 @@ class SubagentManager:
         # 完整执行和收尾都结束后，
         # 一次性发布结果、通知完成并释放名额。
         with self._lock:
+            if state.cancel_event.is_set():
+                finalize_cancelled_subagent(state)
+
             self.results[state.run_id] = state
             self.ready.append(state.run_id)
             self.running.pop(state.run_id, None)
+            self.cancel_events.pop(state.run_id, None)
 
         # 从这里开始，工作线程不再修改 state。
 
@@ -1809,10 +1999,21 @@ class SubagentManager:
         """查询快照，不取走 ready 中的完成通知。"""
         with self._lock:
             if run_id in self.running:
+                event = self.cancel_events.get(run_id)
+                cancelling = (
+                    event is not None and event.is_set()
+                )
+
                 return {
                     "run_id": run_id,
-                    "status": "running",
-                    "message": "子 Agent 正在执行或收尾，最终结果尚未发布。",
+                    "status": (
+                        "cancelling" if cancelling else "running"
+                    ),
+                    "message": (
+                        "已请求取消，正在等待当前操作结束并交接结果。"
+                        if cancelling
+                        else "子 Agent 正在执行或收尾，最终结果尚未发布。"
+                    ),
                 }
 
             state = self.results.get(run_id)
@@ -2176,7 +2377,7 @@ def execute_subagent_tool(tool_call, handlers: dict) -> str:
     try:
         return str(handler(**tool_call.input))
 
-    except TimeoutError:
+    except (TimeoutError, SubagentCancelled):
         # 交给外层子循环设置 timed_out，
         # 不能吞成普通工具错误。
         raise
@@ -2188,6 +2389,13 @@ def execute_subagent_tool(tool_call, handlers: dict) -> str:
 def run_subagent_status(run_id: str) -> str:
     return json.dumps(
         SUBAGENTS.get(run_id),
+        ensure_ascii=False,
+        indent=2,
+    )
+
+def run_subagent_cancel(run_id: str) -> str:
+    return json.dumps(
+        SUBAGENTS.cancel(run_id),
         ensure_ascii=False,
         indent=2,
     )
@@ -2523,6 +2731,12 @@ def build_system_prompt(relevant_memories: str = "") -> str:
             "Use subagent_status with a run_id only when a status check "
             "or a previously finished result is needed. "
             "Do not repeatedly poll; final results arrive automatically. "
+            "Use subagent_cancel with a run_id when that run "
+            "is no longer needed. "
+            "A cancelling receipt is not a final result; "
+            "wait for the automatic result notification. "
+            "Cancellation does not mean the board task is completed. "
+            "Use any preserved evidence to decide what remains to do. "
             "A subagent run status of completed means it submitted a result; "
             "it does not prove the task is solved. "
             "Inspect its summary, remaining work, and evidence. "
@@ -3152,6 +3366,7 @@ TOOL_HANDLERS = {
     "complete_task": run_complete_task,
     "task": run_subagent,
     "subagent_status": run_subagent_status,
+    "subagent_cancel": run_subagent_cancel,
 }
 # -----------------------------------------------------
 
@@ -3666,26 +3881,120 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
         if compact_requested:
             messages[:] = COMPACTOR.compact_history(messages, active_request)
 
-if __name__ == "__main__":
-    print(f"Starting {MODEL} agent at {os.getcwd()}")
-    print("Type 'exit' to end the conversation.")
-    history = []
-    while True:
-        try:
-            # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s01 >> \001\033[0m\002")
-        except (EOFError, KeyboardInterrupt):# Ctrl+C or Ctrl+D exit
-            break
-        if query.strip().lower() in ("q", "exit", ""):# q or exit or empty input exit
-            break
-        trigger_hooks("UserPromptSubmit", query)
-        history.append({"role": "user", "content": query})
-        agent_loop(history, query)
-        # Print the model's final text response
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):# print the model's final text response
-            for block in response_content:
-                if getattr(block, "type", None) == "text":# print the model's final text response
-                    print(block.text)
-        print()
 
+
+
+
+
+
+def cleanup_program() -> None:
+    """程序退出时统一清理；重复调用不会重复执行。"""
+    global _cleanup_started
+
+    if _cleanup_started:
+        return
+
+    _cleanup_started = True
+    print("\n[shutdown] 正在停止后台运行并清理资源……")
+
+    unfinished = []
+
+    # 1. 通知全部子 Agent 停止，最多等待 5 秒。
+    try:
+        unfinished = SUBAGENTS.shutdown(
+            timeout_seconds=5.0
+        )
+    except Exception as exc:
+        print(
+            "[shutdown] 子 Agent 清理出错："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # 2. 清理主 Agent 启动的 Shell 子进程。
+    try:
+        _stop_all_shell_processes()
+    except Exception as exc:
+        print(
+            "[shutdown] Shell 清理出错："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # 3. 断开 MCP。
+    try:
+        disconnect_all_mcp()
+    except Exception as exc:
+        print(
+            "[shutdown] MCP 清理出错："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # 4. 展示尚未被收集的结果。
+    # Shell/MCP 清理期间，子 Agent 也可能刚好完成交接。
+    try:
+        completed = SUBAGENTS.collect()
+
+        for state in completed:
+            print(
+                f"\n[shutdown] 子 Agent 结果：{state.run_id}"
+            )
+            print(format_subagent_result(state))
+
+        for run_id in unfinished:
+            snapshot = SUBAGENTS.get(run_id)
+
+            if snapshot["status"] in ("running", "cancelling"):
+                print(
+                    f"[shutdown] {run_id}："
+                    "等待期限已到，当前仍未完成交接；"
+                    "不会将其标记为取消完成。"
+                )
+
+    except Exception as exc:
+        print(
+            "[shutdown] 结果展示出错："
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    print("[shutdown] 退出清理流程结束。")
+
+
+# 原来的两项注册在前面已经执行。
+# 现在统一交给 cleanup_program，避免退出时重复清理。
+atexit.unregister(_stop_all_shell_processes)
+atexit.unregister(disconnect_all_mcp)
+
+atexit.register(cleanup_program)
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    try:
+        print(f"Starting {MODEL} agent at {os.getcwd()}")
+        print("Type 'exit' to end the conversation.")
+        history = []
+        while True:
+            try:
+                # \001/\002 tell Readline the ANSI escapes have zero display width.
+                query = input("\001\033[36m\002s01 >> \001\033[0m\002")
+            except (EOFError, KeyboardInterrupt):# Ctrl+C or Ctrl+D exit
+                break
+            if query.strip().lower() in ("q", "exit", ""):# q or exit or empty input exit
+                break
+            trigger_hooks("UserPromptSubmit", query)
+            history.append({"role": "user", "content": query})
+            agent_loop(history, query)
+            # Print the model's final text response
+            response_content = history[-1]["content"]
+            if isinstance(response_content, list):# print the model's final text response
+                for block in response_content:
+                    if getattr(block, "type", None) == "text":# print the model's final text response
+                        print(block.text)
+            print()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup_program()
