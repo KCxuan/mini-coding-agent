@@ -5,12 +5,9 @@ import dotenv
 import subprocess
 import anthropic
 from pathlib import Path
-import re
 import json
-import yaml
 from uuid import uuid4
 from dataclasses import dataclass, asdict, field
-import secrets
 import threading
 import signal
 import time
@@ -20,23 +17,37 @@ try:
     import readline
 except ImportError:
     pass
-import asyncio
+
 from collections.abc import Coroutine
 from typing import Any
-from mcp import Client, StdioServerParameters
-from mcp.types import TextContent
+
+
+# ----------------------------------------------------
 
 from CodingAgent.skill_loader import SkillLoader
+
 from CodingAgent.config import load_config
+
 from CodingAgent.prompts import build_subagent_prompt, build_system_prompt
+
 from CodingAgent.taskboard import TaskBoard, TaskStore
+
 from CodingAgent.tools.files import FileTools
+
 from CodingAgent.compact import ContextCompactor
+
 from CodingAgent.hooks import HookRegistry, DefaultHooks
 from CodingAgent.permissions import PermissionManager
+
 from CodingAgent.memory.store import MemoryStore
 from CodingAgent.memory.manager import MemoryManager
 
+from CodingAgent.mcp.config import MCPServerConfig, load_mcp_config
+from CodingAgent.mcp.bridge import AsyncBridge
+from CodingAgent.mcp.client import MCPClient
+from CodingAgent.mcp.config import load_mcp_config
+from CodingAgent.mcp.bridge import AsyncBridge
+from CodingAgent.mcp.manager import MCPManager
 
 dotenv.load_dotenv()
 CONFIG = load_config()
@@ -706,381 +717,23 @@ def drain_background_tasks(
     
 # -------------- 这一部分是MCP的实现代码 ------------
 
-@dataclass
-class MCPServerConfig:
-    name: str
-    command: str | None = None
-    args: list[str] | None = None
-    env: dict[str, str] | None = None
-    url: str | None = None
-    headers: dict[str, str] | None = None
-
-    @property
-    def transport_kind(self) -> str:
-        if self.url:
-            return "http"
-        if self.command:
-            return "stdio"
-        raise ValueError(f"Invalid MCP server config: {self}, missing command or url")
-
-def load_mcp_config(path: Path) -> dict[str, MCPServerConfig]:
-    if not path.is_file():
-        raise FileNotFoundError(f"MCP config file not found: {path}")
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        raise ValueError(f"Invalid MCP config file: {path}, {e}")
-    if not isinstance(raw, dict):
-        raise ValueError("MCP config must be a JSON object")
-    
-    servers = raw.get("mcpServers", {})
-    if not isinstance(servers, dict):
-        raise ValueError("mcpServers must be a JSON object")
-
-    loaded: dict[str, MCPServerConfig] = {}
-    for name, spec in servers.items():
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("MCP server name must be a non-empty string")
-        if not isinstance(spec, dict):
-            raise ValueError(f"MCP server spec for {name} must be a JSON object")
-        
-        command = spec.get("command")
-        args = spec.get("args", [])
-        env = spec.get("env")
-        url = spec.get("url")
-        headers = spec.get("headers")
-
-        if (command and url) or (not command and not url):
-            raise ValueError(f"MCP server {name} must have exactly one of command or url")
-        if command is not None and not isinstance(command, str):
-            raise ValueError(f"MCP server {name!r} command must be a string")
-        if url is not None and not isinstance(url, str):
-            raise ValueError(f"MCP server {name!r} url must be a string")
-        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
-            raise ValueError(f"MCP server {name!r} args must be a list of strings")
-        if env is not None and (
-            not isinstance(env, dict)
-            or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items())
-        ):
-            raise ValueError(f"MCP server {name!r} env must be a string-to-string object")
-        if headers is not None and (
-            not isinstance(headers, dict)
-            or not all(isinstance(k, str) and isinstance(v, str) for k, v in headers.items())
-        ):
-            raise ValueError(f"MCP server {name!r} headers must be a string-to-string object")
-        if headers is not None and (url is None or url.strip() == ""):
-            raise ValueError(f"MCP server {name!r} headers must be provided with url")
-
-
-        loaded[name] = MCPServerConfig(
-            name=name,
-            command=command,
-            args=list(args) if command else None,
-            env=dict(env) if env else None,
-            url=url,
-            headers=dict(headers) if headers else None,
-        )
-    return loaded
-
-def _schema_to_dict(schema: Any) -> dict:
-    """将MCP schema转换为字典"""
-    if schema is None:
-        return {"type": "object", "properties": {}}
-    if isinstance(schema, dict):
-        return schema
-    if hasattr(schema, "model_dump"):
-        dumped = schema.model_dump(by_alias=False, exclude_none=True)
-        return dumped if isinstance(dumped, dict) else {"type": "object"}
-    return {"type": "object", "properties": {}}
-
-class MCPClient:
-    def __init__(self, config: MCPServerConfig, bridge: AsyncBridge):
-        self.config = config
-        self.name = config.name
-        self.transport_kind = config.transport_kind
-        self.tools: list[dict] = []
-        self._session = None
-        self._bridge = bridge
-        self._closed: asyncio.Event | None = None
-        self._ready = threading.Event()
-        self._error: str | None = None
-        self._session_future = None
-
-    def _target(self) -> StdioServerParameters | str:
-        if self.config.url:
-            return self.config.url
-        if not self.config.command:
-            raise ValueError(f"Invalid MCP server config: {self.config}, missing command")
-        return StdioServerParameters(
-            command=self.config.command, 
-            args=self.config.args or [], 
-            env=self.config.env
-        )
-        
-
-    def is_connected(self) -> bool:
-        return self._session is not None
-
-
-    def connect(self, timeout: float = 60.0) -> list[dict]:
-        if self.is_connected():
-            return self.tools
-        self._ready.clear()
-        self._error = None
-        self._session_future = self._bridge.submit(self._session_loop())
-        if not self._ready.wait(timeout=timeout):
-            raise TimeoutError(f"Connecting MCP server {self.name!r} timed out")
-        if self._error:
-            raise RuntimeError(self._error)
-        return self.tools
-    
-    async def _list_all_tools(self, session: Client) -> list[dict]:
-        collected = []
-        cursor = None
-        while True:
-            page = await session.list_tools(cursor=cursor)
-            for tool in page.tools:
-                collected.append({
-                    "name": tool.name,
-                    "description": tool.description or "",
-                    "input_schema": _schema_to_dict(tool.input_schema),
-                })
-            if not page.next_cursor:
-                return collected
-            cursor = page.next_cursor
-
-    async def _open_session(self):
-        """
-        打开一个MCP会话，并列出所有工具
-        """
-        if self.config.url and self.config.headers:
-            import httpx2
-            from mcp.client.streamable_http import streamable_http_client
-
-            timeout = httpx2.Timeout(30.0, read=300.0)
-            async with httpx2.AsyncClient(
-                headers=self.config.headers,
-                timeout=timeout,
-            ) as http:
-                transport = streamable_http_client(
-                    self.config.url,
-                    http_client=http,
-                )
-                async with Client(transport) as session:
-                    yield session
-            return
-        async with Client(self._target()) as session:
-            yield session
-
-
-    async def _session_loop(self) -> None:
-        # asyncio.Event 必须在 bridge 的 loop 里创建
-        self._closed = asyncio.Event()
-        try:
-            async for session in self._open_session():
-                self._session = session
-                self.tools = await self._list_all_tools(session)
-                self._ready.set()
-                await self._closed.wait()
-        except Exception as error:
-            self._error = (
-                f"Failed to connect MCP server {self.name!r}: "
-                f"{type(error).__name__}: {error}"
-            )
-            self._ready.set()
-        finally:
-            self._session = None
-            self._closed = None
-
-    def disconnect(self, timeout: float = 10.0) -> None:
-        closed = self._closed
-        if closed is not None:
-            self._bridge.call_soon(closed.set)
-        future = self._session_future
-        if future is not None:
-            try:
-                future.result(timeout=timeout)
-            except TimeoutError:
-                future.cancel()
-            self._session_future = None
-        self.tools = []
-
-    def call_tool(self, tool_name: str, args: dict | None = None, timeout: float = 120.0) -> str:
-        if self._session is None:
-            return f"MCP error: server {self.name!r} is not connected"
-        try:
-            result = self._bridge.run(
-                self._session.call_tool(tool_name, args or {}),
-                timeout=timeout,
-            )
-            return self._format_mcp_tool_result(result)
-        except TimeoutError:
-            return (
-                f"MCP error: calling {tool_name!r} on {self.name!r} "
-                f"timed out after {timeout}s"
-            )
-        except Exception as error:
-            return f"MCP error: {type(error).__name__}: {error}"
-
-    def _format_mcp_tool_result(self, result: Any) -> str:
-        """把 SDK 的 CallToolResult 收成一段给模型看的文字。"""
-        is_error = bool(getattr(result, "is_error", False))
-        texts: list[str] = []
-        for block in getattr(result, "content", None) or []:
-            if getattr(block, "type", None) == "text":
-                text = getattr(block, "text", "")
-                if text:
-                    texts.append(str(text))
-        body = "\n".join(texts).strip()
-        if not body:
-            structured = getattr(result, "structured_content", None)
-            if structured is not None:
-                body = json.dumps(structured, ensure_ascii=False)
-        if not body:
-            body = "(empty MCP tool result)"
-        if is_error:
-            return f"MCP error: {body}"
-        return body
-
-
-class AsyncBridge:
-    """在后台跑一条常驻事件循环，供同步代码提交协程"""
-
-    def __init__(self):
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        self._lock = threading.Lock()
-    
-    @property
-    def running(self) -> bool:
-        return self._loop is not None and self._loop.is_running()
-
-    def start(self) -> None:
-        with self._lock:
-            if self.running:
-                return
-            ready = threading.Event()
-            self._thread = threading.Thread(
-                target=self._run_loop,
-                args=(ready,),
-                name="mcp-async-bridge",
-                daemon=True,
-            )
-            self._thread.start()
-            if not ready.wait(timeout=10):
-                raise RuntimeError("Failed to start MCP async bridge")
-    
-    def _run_loop(self, ready: threading.Event) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-        ready.set()
-        loop.run_forever()
-        loop.close()
-        self._loop = None
-        
-    def run(self, coro: Coroutine[Any, Any, Any], timeout: float = 120.0) -> Any:
-        """
-        提交一个协程到事件循环，等待结果或超时
-        """
-        self.start()
-        if self._loop is None:
-            raise RuntimeError("MCP async bridge not running")
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        try:
-            return future.result(timeout=timeout)
-        except asyncio.TimeoutError:
-            future.cancel()
-            raise TimeoutError(f"MCP async bridge timed out after {timeout} seconds")
-    
-    def submit(self, coro: Coroutine[Any, Any, Any]):
-        """提交一个协程到事件循环但不等待他结束，用来挂住MCP的async with"""
-        self.start()
-        if self._loop is None:
-            raise RuntimeError("MCP async bridge not running")
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
-
-    def call_soon(self, fn, *args) -> None:
-        """在事件循环中调用一个函数"""
-        if self._loop is None:
-            raise RuntimeError("MCP async bridge not running")
-        self._loop.call_soon_threadsafe(fn, *args)
-    
-    def close(self, timeout: float = 10.0) -> None:
-        """关闭事件循环"""
-        loop = self._loop
-        thread = self._thread
-        if loop is None or thread is None:
-            return
-        
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=timeout)
-        self._thread = None
-    
-
 try:
     MCP_CONFIG = load_mcp_config(MCP_CONFIG_PATH)
 except (FileNotFoundError, ValueError) as e:
     print(f"Error loading MCP config: {e}")
     MCP_CONFIG = {}
 
-MCP_BRIDGE = AsyncBridge()
-mcp_clients: dict[str, MCPClient] = {}
-mcp_tool_policies: dict[str, str] = {}
-
-_DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
-
 MCP_HOST_POLICY = {
     ("fetch", "fetch"): "confirm",
 }
 
-def normalize_mcp_name(name: str) -> str:
-    normalized = _DISALLOWED_CHARS.sub("_", name)
-    if not normalized:
-        raise ValueError(f"Invalid MCP name: {name!r}")
-    return normalized
+MCP_BRIDGE = AsyncBridge()
 
-def connect_mcp(name: str) -> str:
-    existing = mcp_clients.get(name)
-    if existing is not None and existing.is_connected():
-        names = ", ".join(tool["name"] for tool in existing.tools) or "(none)"
-        return f"MCP server {name!r} already connected. Tools: {names}"
-    
-    config = MCP_CONFIG.get(name)
-    if config is None:
-        avaliable = ", ".join(MCP_CONFIG) or "(none)"
-        return f"MCP server {name!r} not found in config. Available: {avaliable}"
-    
-    server = MCPClient(config, MCP_BRIDGE)
-    try:
-        tools = server.connect()
-    except Exception as e:
-        return f"Error: {e}"
-
-    mcp_clients[name] = server
-    names = ", ".join(tool["name"] for tool in tools) or "(none)"
-    print(f"  [mcp] connected: {name} -> {names}")
-    return (
-        f"Connected to MCP server {name!r}. "
-        f"Discovered {len(tools)} tools: {names}"
-    )
-
-def run_connect_mcp(name: str) -> str:
-    try:
-        return connect_mcp(name)
-    except Exception as e:
-        return f"Error: {e}"
-
-def disconnect_all_mcp() -> None:
-    for server_name, server in list(mcp_clients.items()):
-        try:
-            server.disconnect()
-        except Exception as e:
-            print(f"  [mcp] error: {server_name!r} -> {e}")
-        mcp_clients.pop(server_name, None)
-    MCP_BRIDGE.close()
-
-atexit.register(disconnect_all_mcp)
+MCP_MANAGER = MCPManager(
+    MCP_CONFIG,
+    MCP_BRIDGE,
+    host_policy=MCP_HOST_POLICY,
+)
 
 CONNECT_TOOL = {
     "name": "connect_mcp",
@@ -1101,49 +754,6 @@ CONNECT_TOOL = {
     },
 }
 
-def assemble_tool_pool() -> tuple[list[dict], dict]:
-    """每轮把内置工具和已连接 MCP 工具装进同一个池。"""
-    global mcp_tool_policies
-    tools = [*TOOLS, CONNECT_TOOL]
-    handlers = {**TOOL_HANDLERS, "connect_mcp": run_connect_mcp}
-    policies: dict[str, str] = {}
-    origins = {tool["name"]: f"built-in tool {tool['name']!r}" for tool in tools}
-
-    for server_name, server in mcp_clients.items():
-        if not server.is_connected():
-            continue
-        safe_server = normalize_mcp_name(server_name)
-        for tool_def in server.tools:
-            raw_name = tool_def["name"]
-            safe_tool = normalize_mcp_name(raw_name)
-            prefixed = f"mcp__{safe_server}__{safe_tool}"
-            if len(prefixed) > 64:
-                raise ValueError(f"MCP tool name {raw_name!r} too long: {len(prefixed)} > 64")
-            origin = f"MCP tool {server_name!r}.{raw_name!r}"
-            if prefixed in origins:
-                raise ValueError(
-                    "MCP tool name collision after normalization: "
-                    f"{prefixed!r} maps both {origins[prefixed]} and {origin}"
-                )
-            schema = tool_def.get("input_schema") or {"type": "object", "properties": {}}
-            if not isinstance(schema, dict) or schema.get("type", "object") != "object":
-                raise ValueError(f"Invalid input schema for {origin}")
-            
-            origins[prefixed] = origin
-            tools.append({
-                "name": prefixed,
-                "description": tool_def.get("description", ""),
-                "input_schema": schema,
-            })
-            handlers[prefixed] = (
-                lambda *, client=server, tool=raw_name, **kwargs:
-                client.call_tool(tool, kwargs)
-            )
-            policies[prefixed] = MCP_HOST_POLICY.get(
-                (safe_server, raw_name), "confirm"
-            )
-    mcp_tool_policies = policies
-    return tools, handlers
 
 # ------ 这一部分是subagent的扩展实现的相关代码 -------
 
@@ -2208,10 +1818,9 @@ MAX_REACTIVE_RETRIES = 1
 
 PERMISSIONS = PermissionManager(
     WORKDIR,
-    get_mcp_policy=lambda tool_name: mcp_tool_policies.get(
-        tool_name, "confirm"
-    ),
+    get_mcp_policy=MCP_MANAGER.get_tool_policy,
 )
+
 
 HOOKS = HookRegistry()
 DEFAULT_HOOKS = DefaultHooks(WORKDIR)
@@ -2258,15 +1867,14 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             max_subagents=MAX_SUBAGENTS,
             skill_catalog=SKILL_LOADER.catalog(),
             memory_index=MEMORY_STORE.read_memory_index(),
-            available_mcp_servers=list(MCP_CONFIG),
-            connected_mcp_servers=[
-                name 
-                for name, server in mcp_clients.items() 
-                if server.is_connected()
-            ],
+            available_mcp_servers=MCP_MANAGER.available_servers(),
+            connected_mcp_servers=MCP_MANAGER.connected_servers(),
             relevant_memories=relevant,
         )
-        tools, handlers = assemble_tool_pool()
+        tools, handlers = MCP_MANAGER.assemble_tool_pool(
+            builtin_tools=TOOLS,
+            builtin_handlers=TOOL_HANDLERS,
+        )
         try:
             response = client.messages.create(
                 model=MODEL,
@@ -2426,7 +2034,7 @@ def cleanup_program() -> None:
 
     # 3. 断开 MCP。
     try:
-        disconnect_all_mcp()
+        MCP_MANAGER.disconnect_all_mcp()
     except Exception as exc:
         print(
             "[shutdown] MCP 清理出错："
@@ -2466,7 +2074,6 @@ def cleanup_program() -> None:
 # 原来的两项注册在前面已经执行。
 # 现在统一交给 cleanup_program，避免退出时重复清理。
 atexit.unregister(_stop_all_shell_processes)
-atexit.unregister(disconnect_all_mcp)
 atexit.register(cleanup_program)
 
 
