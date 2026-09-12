@@ -45,9 +45,14 @@ from CodingAgent.memory.manager import MemoryManager
 from CodingAgent.mcp.config import MCPServerConfig, load_mcp_config
 from CodingAgent.mcp.bridge import AsyncBridge
 from CodingAgent.mcp.client import MCPClient
-from CodingAgent.mcp.config import load_mcp_config
-from CodingAgent.mcp.bridge import AsyncBridge
 from CodingAgent.mcp.manager import MCPManager
+
+from CodingAgent.tools.shell import ShellRunner, format_bash_output
+
+from CodingAgent.background import (
+    BackgroundManager,
+    should_run_background,
+)
 
 dotenv.load_dotenv()
 CONFIG = load_config()
@@ -424,109 +429,9 @@ class TODOManager:
 TODO = TODOManager()
 
 
-
 # ------------- 带有后台跑命令的bash工具 -------------
 
-# 全局：跟踪所有的shell进程，便于退出时清理
-_shell_processes: set[subprocess.Popen] = set()
-_shell_process_lock = threading.RLock()
-
-_IS_WINDOWS = sys.platform == "win32"
-
-def _stop_process_group(process):
-    """停止一个进程组及其所有子进程"""
-    if process.poll() is not None:
-        # poll() 返回非None，表示进程已结束
-        return
-    
-    if _IS_WINDOWS:
-        # windows 没有killpg 对Popen对象本身进行terminate/kill
-        for sig_fn in (process.terminate, process.kill):
-            try:
-                sig_fn()
-            except OSError:
-                pass
-            if process.poll() is not None:
-                return
-            time.sleep(0.05)
-    else:
-        # linux/macos 使用killpg停止进程组
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(process.pid, sig)
-            except (OSError, ProcessLookupError):
-                return
-            if process.poll() is not None:
-                return
-            time.sleep(0.05)
-
-
-def _stop_all_shell_processes():
-    """停止所有shell进程"""
-    with _shell_process_lock:
-        processes = list(_shell_processes)
-    for process in processes:
-        _stop_process_group(process)
-
-def _popen_kwargs() -> dict:
-    """按照不同的平台返回 subprocess.Popen 的 kwargs"""
-    kwargs: dict = {
-        "shell": True,
-        "cwd": WORKDIR,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "text": True,
-        "errors": "replace",
-    }
-    if _IS_WINDOWS:
-        # windows 新进程组，便于后续terminate时不误伤agent自身
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        # linux/macos 独立session, 可以killpg
-        kwargs["start_new_session"] = True
-    return kwargs
-
-def _run_bash_process(command: str, *, timeout=120.0) -> tuple[str, int | None]:
-    """
-    运行一个bash命令，返回输出和退出码
-    """
-    process: subprocess.Popen | None = None
-    try:
-        process = subprocess.Popen(command, **_popen_kwargs())
-        with _shell_process_lock:
-            _shell_processes.add(process)
-        stdout, stderr = process.communicate(timeout=timeout)
-        output = (stdout + stderr).strip()
-        if len(output) > 50000:
-            output = output[:50000]
-        return (output if output else "(no output)", process.returncode)
-    except subprocess.TimeoutExpired:
-        return "Error: Command timed out.", None
-    except OSError as e:
-        return f"Error: {e}", None
-    finally:
-        if process:
-            _stop_process_group(process)
-            try:
-                process.wait(timeout=0.1)
-            except subprocess.TimeoutExpired:
-                pass
-            with _shell_process_lock:
-                _shell_processes.discard(process)
-        
-
-def _format_bash_output(output: str, exit_code: int | None) -> str:
-    """exit_code != 0 时加入 Error 前缀"""
-    if exit_code in (0, None):
-        return output
-    return f"Error: Command exited with code {exit_code}\n{output}"
-
-"""
-def _handle_termination_signal(signum, _frame):
-    print(f"  [background] received signal {signum}, terminating all shell processes")
-    _stop_all_shell_processes()
-    raise SystemExit(128 + signum)
-"""
+SHELL = ShellRunner(WORKDIR)
 
 # 防止重复 Ctrl+C 打断正在进行的清理。
 _exit_requested = False
@@ -543,8 +448,7 @@ def _handle_termination_signal(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-atexit.register(_stop_all_shell_processes)
-if _IS_WINDOWS:
+if sys.platform == "win32":
     signal.signal(signal.SIGINT, _handle_termination_signal)
 else:
     signal.signal(signal.SIGTERM, _handle_termination_signal)
@@ -552,169 +456,8 @@ else:
 
 # ------此部分是 background tasks 的实现代码 ---------
 
-class BackgroundManager:
-    def __init__(self):
-        self.tasks = {}      # bg_0001 → {tool_use_id, command, status}
-        self.results = {}    # bg_0001 → 输出文本
-        self._ready = []     # 已完成、待收集的 task_id 列表
-        self._counter = 0
-        self._lock = threading.Lock()
+BACKGROUND = BackgroundManager(SHELL)
 
-    def start(self, block) -> str:
-        # 1. 校验：只有 bash、command 非空
-        # 2. 生成 task_id = f"bg_{counter:04d}"
-        # 3. 登记 tasks[task_id] = {..., status: "running"}
-        # 4. threading.Thread(target=self._run, daemon=True).start()
-        # 5. 立即返回 task_id
-        if block.name != "bash" or not block.input.get("command"):
-            return "Error: Invalid command"
-        
-        command = block.input.get("command")
-        with self._lock:
-            self._counter += 1
-            task_id = f"bg_{self._counter:04d}"
-            self.tasks[task_id] = {
-                "tool_use_id": block.id,
-                "command": command,
-                "status": "running"
-            }
-            thread = threading.Thread(target=self._run, args=(task_id, command), daemon=True)
-        try:
-            thread.start()
-        except Exception as e:
-            with self._lock:
-                self.tasks.pop(task_id, None)
-            raise
-        print(f"  [background] started {task_id}: {command[:60]}")
-        return task_id
-
-    def _run(self, task_id, command):
-        # 1. 调用 _run_bash_process(command)
-        # 2. 根据 exit_code 设 status = "completed" / "failed"
-        # 3. 写入 results，追加到 _ready
-        # 4. 清理进程
-        try:
-            output, exit_code = _run_bash_process(command)
-            result = _format_bash_output(output, exit_code)
-            status = "completed" if exit_code == 0 else "failed"
-        except Exception as e:
-            result = f"Error: {e}"
-            status = "failed"
-        
-        with self._lock:
-            task = self.tasks.get(task_id, None)
-            if task is None:
-                return
-            task["status"] = status
-            self.results[task_id] = result
-            self._ready.append(task_id)
-            
-
-    def collect(self) -> list[str]:
-        # 1. 从 _ready 取出所有已完成任务
-        # 2. 格式化为 <task_notification> XML 字符串
-        # 3. 清空 _ready，返回 notification 列表
-        # 4. 返回 notification 列表
-        with self._lock:
-            ready = []
-            for task_id in self._ready:
-                task = self.tasks.pop(task_id, None)
-                result = self.results.pop(task_id, None)
-                if task is not None:
-                    ready.append((task_id, task, result))
-            self._ready.clear()
-
-        notifications = []
-        for task_id, task, result in ready:
-            notifications.append(
-                f"<task_notification>\n"
-                f"  <task_id>{task_id}</task_id>\n"
-                f"  <status>{task['status']}</status>\n"
-                f"  <command>{task['command']}</command>\n"
-                f"  <summary>{result[:500]}</summary>\n"
-                f"</task_notification>"
-            )
-            print(f"  [background] collected {task_id}: {task['status']}")
-        return notifications
-
-    def has_running(self) -> bool:
-        with self._lock:
-            return any(task["status"] == "running" for task in self.tasks.values())
-        
-    def running_tasks(self) -> list[dict]:
-        with self._lock:
-            return [
-                {"task_id": task_id, **task}
-                for task_id, task in self.tasks.items()
-                if task["status"] == "running"
-            ]
-    
-
-
-BACKGROUND = BackgroundManager()
-background_tasks = BACKGROUND.tasks
-background_results = BACKGROUND.results
-
-
-def should_run_background(tool_name, tool_input) -> bool:
-    return tool_name == "bash" and tool_input.get("run_in_background") is True
-
-def start_background_task(block) -> str:
-    return BACKGROUND.start(block)
-
-def collect_background_results() -> list[str]:
-    return BACKGROUND.collect()
-
-def inject_background_results(messages: list) -> int:
-    # 将工具的返回结果注入到messages中，大模型会根据这些结果继续推理
-    # 调用 collect_background_results()
-    # 若有 notification，追加到 messages 最后一条 user message
-    # 或新建一条 user message
-    # 返回注入条数
-    notifications = collect_background_results()
-    if not notifications:
-        return 0
-    
-    block = [{"type": "text", "text": item} for item in notifications]
-    if messages and messages[-1].get("role") == "user":
-        content = messages[-1].get("content")
-        if isinstance(content, list):
-            content.extend(block)
-        else:
-            messages[-1]["content"] = [
-                {"type": "text", "text": content},
-                *block,
-            ]
-    else:
-        messages.append({"role": "user", "content": block})
-    return len(notifications)
-
-def drain_background_tasks(
-    messages: list,
-    *,
-    timeout: float = 120.0,
-    poll_interval: float = 0.2,
-) -> list[str]:
-    """
-    等待后台任务结束并 inject 已完成结果。
-    返回超时后仍在 running 的 task_id 列表。
-    """
-    deadline = time.monotonic() + timeout
-
-    while True:
-        inject_background_results(messages)
-        if not BACKGROUND.has_running():
-            return []
-        if time.monotonic() > deadline:
-            break
-        time.sleep(poll_interval)
-    
-    inject_background_results(messages)
-    with BACKGROUND._lock:
-        return [
-            tid for tid, t in BACKGROUND.tasks.items() if t["status"] == "running"
-        ]
-    
 # -------------- 这一部分是MCP的实现代码 ------------
 
 try:
@@ -734,25 +477,6 @@ MCP_MANAGER = MCPManager(
     MCP_BRIDGE,
     host_policy=MCP_HOST_POLICY,
 )
-
-CONNECT_TOOL = {
-    "name": "connect_mcp",
-    "description": (
-        "Connect to a configured MCP server and discover its tools. "
-        "Call this before using any mcp__server__tool. "
-        "Available servers are listed in the enum."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "name": {
-                "type": "string",
-                "enum": list(MCP_CONFIG.keys()) or ["(no servers configured)"],
-            }
-        },
-        "required": ["name"],
-    },
-}
 
 
 # ------ 这一部分是subagent的扩展实现的相关代码 -------
@@ -1516,7 +1240,7 @@ SUBAGENTS = SubagentManager(max_workers=MAX_SUBAGENTS)
 
 # 定义工具执行函数（bash）
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    return _format_bash_output(*_run_bash_process(command))
+    return format_bash_output(*SHELL.run_bash_process(command))
     """
     dangeros = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(word in command.lower() for word in dangeros):
@@ -1541,8 +1265,6 @@ def run_bash(command: str, run_in_background: bool = False) -> str:
 
 FILES = FileTools(WORKDIR)
 
-
-
 # 定义写入TODO的工具执行函数(todo_write)，已废弃，改由task系统替代
 def run_todo_write(todos: list) -> str:
     try:
@@ -1556,7 +1278,7 @@ def execute_tool(tool_call, handlers: dict, *, allow_background: bool = True) ->
         return str(blocked)
     if allow_background and should_run_background(tool_call.name, tool_call.input):
         try:
-            task_id = start_background_task(tool_call)
+            task_id = BACKGROUND.start(tool_call)
             output = (
                 f"Background task started: {task_id}\n"
                 "The result will be collected and injected into the messages later."
@@ -1675,7 +1397,7 @@ def inject_subagent_results(
 def inject_async_results(
     messages: list[dict],
 ) -> int:
-    shell_count = inject_background_results(
+    shell_count = BACKGROUND.inject_background_results(
         messages
     )
     subagent_count = inject_subagent_results(
@@ -1748,7 +1470,7 @@ def run_subagent_cancel(run_id: str) -> str:
 
 
 BASE_TOOL_HANDLERS = {
-    "bash": run_bash,
+    "bash": SHELL.run_bash,
     "read_file": FILES.run_read_file,
     "write_file": FILES.run_write_file,
     "edit_file": FILES.run_edit_file,
@@ -2025,7 +1747,7 @@ def cleanup_program() -> None:
 
     # 2. 清理主 Agent 启动的 Shell 子进程。
     try:
-        _stop_all_shell_processes()
+        SHELL.stop_all_shell_processes()
     except Exception as exc:
         print(
             "[shutdown] Shell 清理出错："
@@ -2073,7 +1795,6 @@ def cleanup_program() -> None:
 
 # 原来的两项注册在前面已经执行。
 # 现在统一交给 cleanup_program，避免退出时重复清理。
-atexit.unregister(_stop_all_shell_processes)
 atexit.register(cleanup_program)
 
 
