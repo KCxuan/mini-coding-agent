@@ -1,4 +1,5 @@
-# Coding Agent
+# mini-coding-agent
+一个模块化 Python Coding Agent，支持工具调用、只读子 Agent、MCP、Skill、记忆管理与上下文压缩。
 
 一个 Python 命令行 Coding Agent：通过模型自主选择工具，完成文件阅读、代码修改、命令执行和结果验证。主 Agent 负责开发与整合，只读子 Agent 负责分析、调查和审查。
 
