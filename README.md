@@ -112,20 +112,19 @@ python -m pip install anthropic==1.2.0 python-dotenv==1.2.3 PyYAML==6.0.3 mcp==2
 
 ### 2. 配置模型
 
-在仓库根目录新建 `.env`：
+复制仓库根目录的 `.env.example` 为 `.env`，并填写三项必填配置：
 
 ```dotenv
 ANTHROPIC_API_KEY=your-api-key
 ANTHROPIC_MODEL=your-model-id
-# 使用兼容服务时填写其 API 基础地址；直连默认服务可省略。
-# ANTHROPIC_BASE_URL=https://your-provider.example
+ANTHROPIC_BASE_URL=https://your-provider.example
 ```
 
 | 环境变量 | 必填 | 说明 |
 | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | 是 | 模型服务的 API 密钥 |
 | `ANTHROPIC_MODEL` | 是 | 服务支持的模型标识，没有内置默认模型 |
-| `ANTHROPIC_BASE_URL` | 否 | 兼容服务的 API 基础地址 |
+| `ANTHROPIC_BASE_URL` | 是 | 模型服务的 API 基础地址 |
 
 已有进程环境变量优先于 `.env`。运行任务会调用配置的模型服务，并产生相应的 API 用量。
 
