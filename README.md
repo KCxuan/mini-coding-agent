@@ -95,7 +95,7 @@ Windows PowerShell：
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install anthropic==1.2.0 python-dotenv==1.2.3 PyYAML==6.0.3 mcp==2.1.1
+python -m pip install -r requirements.txt
 ```
 
 Linux / macOS：
@@ -103,12 +103,12 @@ Linux / macOS：
 ```sh
 python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install anthropic==1.2.0 python-dotenv==1.2.3 PyYAML==6.0.3 mcp==2.1.1
+python -m pip install -r requirements.txt
 ```
 
 如果 PowerShell 不允许激活脚本，可以不激活环境，改用 `.\.venv\Scripts\python.exe` 执行后续的 `python` 命令。
 
-以上是项目使用的直接依赖版本，尚未提供完整依赖锁文件。当前 MCP 代码使用 SDK 的 `Client` 接口，请使用上述版本，避免与旧版接口混用。
+`requirements.txt` 固定了当前直接依赖版本。MCP 代码使用 SDK 的 `Client` 接口，请使用文件中的版本，避免与旧版接口混用。
 
 ### 2. 配置模型
 
