@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from uuid import uuid4
 
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -19,10 +20,57 @@ def format_bash_output(output: str, exit_code: int | None) -> str:
 
 
 class ShellRunner:
-    def __init__(self, workdir: Path):
+    def __init__(self, workdir: Path, *, output_dir: Path | None = None):
         self.workdir = workdir.resolve()
+        self.output_dir = (
+            output_dir
+            if output_dir is not None
+            else self.workdir / ".task_outputs" / "tool-results"
+        ).resolve()
         self._processes: set[subprocess.Popen] = set()
         self._lock = threading.RLock()
+    
+    def prepare_output(
+        self,
+        output: str,
+        *,
+        inline_limit: int = 500,
+    ) -> tuple[str, str | None]:
+        """
+        返回：(要交给模型的正文或预览, 全文路径)。
+        短输出：直接返回全文，不创建文件。
+        长输出：先保存全文，再返回最多 500 字符的首尾预览。
+        """
+        if len(output) <= inline_limit:
+            return output, None
+        try:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            path = self.output_dir / f"shell_{uuid4().hex}.txt"
+            with path.open("x", encoding="utf-8", newline="") as file:
+                file.write(output)
+
+        except OSError as error:
+            # 保存失败时，不返回虚假的路径，也不截掉原输出。
+            # 这次退回全文交付，并明确说明原因。
+            return (
+                f"[output archive failed] {error}\n"
+                f"以下为未截断的输出：\n{output}",
+                None,
+            )
+
+        # 包括省略提示在内，预览最多 500 字符。
+        marker = "\n... [中间内容已省略，请读取全文] ...\n"
+        remaining = 500 - len(marker)
+        head_size = (remaining + 1) // 2
+        tail_size = remaining // 2
+
+        preview = (
+            output[:head_size]
+            + marker
+            + output[-tail_size:]
+        )
+
+        return preview, str(path)
 
     def _stop_process_group(self, process: subprocess.Popen):
         """停止一个进程组及其所有子进程"""
@@ -88,8 +136,6 @@ class ShellRunner:
                 self._processes.add(process)
             stdout, stderr = process.communicate(timeout=timeout)
             output = (stdout + stderr).strip()
-            if len(output) > 50000:
-                output = output[:50000]
             return (output if output else "(no output)", process.returncode)
         except subprocess.TimeoutExpired:
             return "Error: Command timed out.", None
@@ -110,4 +156,20 @@ class ShellRunner:
         command: str,
         run_in_background: bool = False,
     ) -> str:
-        return format_bash_output(*self.run_bash_process(command))
+        output, exitcode = self.run_bash_process(command)
+        result = format_bash_output(output, exitcode)
+
+        preview, full_path = self.prepare_output(result, inline_limit=50000)
+
+        if full_path is None:
+            return preview
+
+        # 使用现有压缩模块能识别的存档格式。
+        return (
+            "<persisted-output>\n"
+            f"Full output: {full_path}\n"
+            "Preview:\n"
+            f"{preview}\n"
+            "需要完整详情时，请使用 read_file 读取上述文件。\n"
+            "</persisted-output>"
+        )

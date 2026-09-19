@@ -111,7 +111,7 @@ run_todo_write = TODO.run_todo_write
 
 # ------------- 带有后台跑命令的bash工具 -------------
 
-SHELL = ShellRunner(WORKDIR)
+SHELL = ShellRunner(WORKDIR, output_dir=TOOL_RESULTS_DIR)
 
 # 防止重复 Ctrl+C 打断正在进行的清理。
 _exit_requested = False
@@ -295,6 +295,130 @@ TOOL_HANDLERS = {
     "compact": run_compact,
 }
 
+# ------------- 主循环的输出异常判断 -------------
+
+# 首次请求的输出额度
+MAIN_OUTPUT_TOKENS = 16384
+
+# 截断后重试的输出额度
+MAIN_RETRY_OUTPUT_TOKENS = 16384 * 2
+
+# 首次请求之外，最多再请求一次
+MAX_RESPONSE_RETRIES = 1
+
+
+class IncompleteResponseError(RuntimeError):
+    """未能取得可继续使用的模型响应。"""
+
+
+def request_usable_response(
+    messages: list[dict],
+    system_prompt: str,
+    tools: list,
+):
+    max_tokens = MAIN_OUTPUT_TOKENS
+
+    # MAX_RESPONSE_RETRIES = 1 时：
+    # attempt 分别是 0、1，总共最多请求两次。
+    for attempt in range(MAX_RESPONSE_RETRIES + 1):
+        response = client.messages.create(
+            model=MODEL,
+            system=system_prompt,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+        )
+
+        stop_reason = getattr(response, "stop_reason", None)
+        blocks = response.content or []
+
+        # 空字符串、只有空格的文本，不算有效正文。
+        has_text = any(
+            getattr(block, "type", None) == "text"
+            and bool(getattr(block, "text", "").strip())
+            for block in blocks
+        )
+
+        has_tools = any(
+            getattr(block, "type", None) == "tool_use"
+            for block in blocks
+        )
+
+        # 1. 优先检查截断。
+        # 即使已经出现正文或工具调用，也不使用这份响应。
+        if stop_reason == "max_tokens":
+            problem = "模型输出达到上限，回答被截断"
+            max_tokens = MAIN_RETRY_OUTPUT_TOKENS
+
+        # 2. 对暂未支持的停止原因，明确报错。
+        # 不擅自把未知状态当成正常结束。
+        elif stop_reason not in ("end_turn", "tool_use"):
+            raise IncompleteResponseError(
+                f"暂未处理的停止原因：{stop_reason!r}"
+            )
+
+        # 3. 模型说要调用工具，却没有返回工具调用。
+        elif stop_reason == "tool_use" and not has_tools:
+            problem = "模型声明要调用工具，但没有返回工具调用"
+
+        # 4. 停止原因与工具内容矛盾，不执行工具。
+        elif stop_reason == "end_turn" and has_tools:
+            raise IncompleteResponseError(
+                "模型声明回答结束，却同时返回了工具调用"
+            )
+
+        # 5. 响应完整，且有正文或工具调用，交回原流程。
+        elif has_text or has_tools:
+            return response
+
+        # 6. 没有正文，也没有工具调用：
+        # 包括空响应、只有思考内容、只有空白文本。
+        else:
+            problem = "模型没有返回正文或工具调用"
+
+        # 已经用完重试机会。
+        if attempt == MAX_RESPONSE_RETRIES:
+            raise IncompleteResponseError(
+                f"{problem}；已重试 {MAX_RESPONSE_RETRIES} 次，"
+                "本轮未完成"
+            )
+
+        print(
+            f"[response retry] {problem}；"
+            f"准备重试，输出上限为 {max_tokens}"
+        )
+
+# --------------------------------------------------------
+
+# 首次允许 60 轮，每次续跑也增加 60 轮。
+AGENT_ROUND_BATCH = 60
+
+
+class AgentRoundLimitError(RuntimeError):
+    """轮数额度已用完，用户未授权继续。"""
+
+
+def confirm_more_rounds(rounds_used: int) -> bool:
+    """询问用户是否为当前任务增加一批执行轮数。"""
+
+    while True:
+        try:
+            answer = input(
+                f"\n当前任务已运行 {rounds_used} 轮，尚需继续处理。\n"
+                f"是否再允许 {AGENT_ROUND_BATCH} 轮？[y/N]: "
+            ).strip().lower()
+
+        except EOFError:
+            # 输入通道关闭时，不自动授权继续。
+            return False
+
+        if answer in ("y", "yes"):
+            return True
+
+        if answer in ("", "n", "no"):
+            return False
+
+        print("请输入 y 继续，或输入 n / 直接回车停止。")
 
 def agent_loop(messages: list[dict],active_request: str) -> str:
     """
@@ -305,9 +429,30 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
     #rounds_since_todo = 0
     rounds_since_task = 0
     reactive_retries = 0
+
+    # 记录总共已使用多少轮。
+    rounds_used = 0
+    # 用户目前单次授权的总轮数
+    rounds_allowed = AGENT_ROUND_BATCH
+    # 用户本次循环的工具调用次数
+    tool_call_count = 0
+
     relevant = MEMORY_MANAGER.load_memories(messages)
     
     while True:
+
+        if rounds_used >= rounds_allowed:
+            if not confirm_more_rounds(rounds_used):
+                raise AgentRoundLimitError(
+                    f"已运行 {rounds_used} 轮，"
+                    "用户未授权继续，本次任务已停止。"
+                )
+            rounds_allowed += AGENT_ROUND_BATCH
+            print(
+                f"[继续] 总额度已增加到 {rounds_allowed} 轮，"
+                f"即将开始第 {rounds_used + 1} 轮。"
+            )
+        rounds_used += 1
 
         inject_async_results(messages) # 将背景任务以及子Agent的结果注入到messages中，大模型会根据这些结果继续推理
         messages[:] = COMPACTOR.prepare(messages, active_request)
@@ -325,12 +470,10 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             builtin_handlers=TOOL_HANDLERS,
         )
         try:
-            response = client.messages.create(
-                model=MODEL,
-                system=system_prompt,
+            response = request_usable_response(
                 messages=messages,
+                system_prompt=system_prompt,
                 tools=tools,
-                max_tokens=8192,
             )
             reactive_retries = 0
         except Exception as error:
@@ -378,7 +521,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
                 # 重新调用模型判断下一步。
                 continue
 
-            force = HOOKS.trigger("Stop", messages)
+            force = HOOKS.trigger("Stop", messages, tool_call_count)
             if force:
                 messages.append({"role": "user", "content": force})
                 continue
@@ -407,6 +550,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
                 used_task = True
             #trigger_hooks("PreToolUse", tool_call)
             #tool_result = TOOL_HANDLERS[tool_call.name](**tool_call.input)
+            tool_call_count += 1
             tool_result = TOOL_DISPATCHER.execute_tool(tool_call, handlers)
             suffix = "... [terminal preview truncated]" if len(tool_result) > 500 else ""
             print(f"Tool result: {tool_result[:500]}{suffix}")
@@ -539,6 +683,13 @@ if __name__ == "__main__":
                     if getattr(block, "type", None) == "text":# print the model's final text response
                         print(block.text)
             print()
+    except (IncompleteResponseError, AgentRoundLimitError) as error:
+        print(f"\n[未完成] {error}")
+        print(
+            "当前程序将退出并执行清理。"
+            "此前已经执行的文件修改不会自动撤销。"
+        )
+        raise SystemExit(1)
     except KeyboardInterrupt:
         pass
     finally:

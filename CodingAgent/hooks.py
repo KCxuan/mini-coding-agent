@@ -41,13 +41,6 @@ class DefaultHooks:
             print(f"[HOOK] ⚠ Large output from {block.name}")
 
     # Stop: 退出总结实际调用工具的次数
-    def summary_hook(self, messages: list[dict]) -> str | None:
-        tool_count = 0
-        for m in messages:
-            content = m.get("content", [])
-            blocks = content if isinstance(content, list) else []
-            for block in blocks:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    tool_count += 1
-        print(f"[HOOK] Total tool calls: {tool_count}")
+    def summary_hook(self, messages: list[dict], tool_call_count: int) -> str | None:
+        print(f"[HOOK] Total tool calls: {tool_call_count}")
         return None

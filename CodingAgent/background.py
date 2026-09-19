@@ -2,6 +2,7 @@ import threading
 import time
 
 from .tools.shell import ShellRunner, format_bash_output
+from xml.sax.saxutils import escape
 
 class BackgroundManager:
     def __init__(self, shell: ShellRunner):
@@ -46,6 +47,7 @@ class BackgroundManager:
         # 2. 根据 exit_code 设 status = "completed" / "failed"
         # 3. 写入 results，追加到 _ready
         # 4. 清理进程
+        exit_code = None
         try:
             output, exit_code = self.shell.run_bash_process(command)
             result = format_bash_output(output, exit_code)
@@ -59,35 +61,68 @@ class BackgroundManager:
             if task is None:
                 return
             task["status"] = status
+            task["exit_code"] = exit_code
             self.results[task_id] = result
             self._ready.append(task_id)
             
 
     def collect(self) -> list[str]:
-        # 1. 从 _ready 取出所有已完成任务
-        # 2. 格式化为 <task_notification> XML 字符串
-        # 3. 清空 _ready，返回 notification 列表
-        # 4. 返回 notification 列表
+        # 1. 首先获取 _ready 列表，再逐个处理。
+        # 2. 对于每个 task_id，获取 task 和 result。
+        # 3. 调用 shell.prepare_output(result, inline_limit=500) 获取 preview 和 full_path。
+        # 4. 构建 notification，追加到 notifications 列表。
+        notifications = []
+
         with self._lock:
-            ready = []
-            for task_id in self._ready:
-                task = self.tasks.pop(task_id, None)
-                result = self.results.pop(task_id, None)
-                if task is not None:
-                    ready.append((task_id, task, result))
+            ready_ids = list(self._ready)
+
+            # 先准备好全部通知，再移除原记录。
+            for task_id in ready_ids:
+                task = self.tasks[task_id]
+                result = self.results[task_id]
+
+                preview, full_path = self.shell.prepare_output(
+                    result,
+                    inline_limit=500,
+                )
+
+                exit_code = task.get("exit_code")
+                exit_text = (
+                    str(exit_code)
+                    if exit_code is not None
+                    else "unknown"
+                )
+
+                full_output_field = ""
+                if full_path is not None:
+                    full_output_field = (
+                        f"  <full_output>{escape(full_path)}</full_output>\n"
+                        "  <hint>需要更多详情时，使用 read_file "
+                        "读取 full_output 指向的文件。</hint>\n"
+                    )
+
+                notifications.append(
+                    "<task_notification>\n"
+                    f"  <task_id>{escape(task_id)}</task_id>\n"
+                    f"  <status>{escape(task['status'])}</status>\n"
+                    f"  <exit_code>{exit_text}</exit_code>\n"
+                    f"  <command>{escape(task['command'])}</command>\n"
+                    f"{full_output_field}"
+                    f"  <summary>{escape(preview)}</summary>\n"
+                    "</task_notification>"
+                )
+
+            # 此时结果已保存到文件，
+            # 或者完整内容已放进即将返回的通知。
+            for task_id in ready_ids:
+                self.tasks.pop(task_id, None)
+                self.results.pop(task_id, None)
+
             self._ready.clear()
 
-        notifications = []
-        for task_id, task, result in ready:
-            notifications.append(
-                f"<task_notification>\n"
-                f"  <task_id>{task_id}</task_id>\n"
-                f"  <status>{task['status']}</status>\n"
-                f"  <command>{task['command']}</command>\n"
-                f"  <summary>{result[:500]}</summary>\n"
-                f"</task_notification>"
-            )
-            print(f"  [background] collected {task_id}: {task['status']}")
+        for task_id in ready_ids:
+            print(f"  [background] collected {task_id}")
+
         return notifications
 
     def has_running(self) -> bool:
