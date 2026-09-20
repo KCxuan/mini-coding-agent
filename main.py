@@ -63,7 +63,6 @@ from CodingAgent.tools.adapters import SubagentTools, run_compact
 from CodingAgent.tools.dispatcher import ToolDispatcher
 
 from CodingAgent.context_budget import (
-    CONTEXT_WINDOW_TOKENS,
     ContextBudgetError,
     estimate_request_tokens,
 )
@@ -221,7 +220,10 @@ TASK_BOARD = TaskBoard(TASKS)
 # ------------此部分为compact的相关实现代码 --------------
 
         
-COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
+COMPACTOR = ContextCompactor(
+    client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR,
+    context_window_tokens=CONFIG.context_window_tokens,
+)
 
 MAX_REACTIVE_RETRIES = 1
 
@@ -508,7 +510,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
         print(
             f"[context] 输入约 {estimated:,} token；"
             f"含输出预留约占 "
-            f"{(estimated + output_reserve) / CONTEXT_WINDOW_TOKENS:.1%}"
+            f"{(estimated + output_reserve) / CONFIG.context_window_tokens:.1%}"
         )
 
         try:

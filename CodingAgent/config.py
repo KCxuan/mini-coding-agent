@@ -17,6 +17,8 @@ class AgentConfig:
     model: str | None
     # 最大子代理数
     max_subagents: int = 4
+    # 上下文窗口大小
+    context_window_tokens: int = 1_000_000
 
     @property
     def skills_dir(self) -> Path:

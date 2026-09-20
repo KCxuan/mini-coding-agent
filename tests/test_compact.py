@@ -26,7 +26,10 @@ class CompactTests(IsolatedTestCase):
         super().setUp()
         self.client = ScriptedClient(text_response("Goal and constraints preserved."))
         self.compactor = ContextCompactor(
-            self.client, "offline-model", self.workdir / "transcripts", self.workdir / "outputs")
+            self.client, "offline-model",
+            self.workdir / "transcripts", self.workdir / "outputs",
+            context_window_tokens=1_000_000,
+        )
 
     def assert_tool_pairs(self, messages):
         pending = set()
@@ -205,9 +208,9 @@ class CompactTests(IsolatedTestCase):
     def test_oversized_summary_request_stops_before_model_call(self):
         messages = self.history(count=8, output="中" * 10000)
         before = copy.deepcopy(messages)
-        with patch("CodingAgent.compact.CONTEXT_WINDOW_TOKENS", 5000):
-            with self.assertRaisesRegex(ContextBudgetError, "摘要请求自身超过预算"):
-                self.compactor.compact_history(messages, "Read")
+        self.compactor.context_window_tokens = 5000
+        with self.assertRaisesRegex(ContextBudgetError, "摘要请求自身超过预算"):
+            self.compactor.compact_history(messages, "Read")
         self.assertEqual(self.client.calls, [])
         self.assertEqual(messages, before)
 
@@ -224,18 +227,18 @@ class CompactTests(IsolatedTestCase):
     def test_prepare_budget_includes_output_reserve_at_trigger_boundary(self):
         messages = [{"role": "user", "content": "Read"}]
         input_tokens = estimate_request_tokens("system", messages, [])
-        with patch("CodingAgent.compact.CONTEXT_WINDOW_TOKENS", 10000):
-            self.assertEqual(self.prepare(messages, reserve=9000 - input_tokens - 1), messages)
-            # 刚好到 90% 就必须压缩；这里没有旧历史可缩，所以明确停止。
-            with self.assertRaises(ContextBudgetError):
-                self.prepare(messages, reserve=9000 - input_tokens)
+        self.compactor.context_window_tokens = 10000
+        self.assertEqual(self.prepare(messages, reserve=9000 - input_tokens - 1), messages)
+        # 刚好到 90% 就必须压缩；这里没有旧历史可缩，所以明确停止。
+        with self.assertRaises(ContextBudgetError):
+            self.prepare(messages, reserve=9000 - input_tokens)
         self.assertEqual(self.client.calls, [])
 
     def test_prepare_micro_compaction_suffices_without_model_call(self):
         messages = self.history()
         before = copy.deepcopy(messages)
-        with patch("CodingAgent.compact.CONTEXT_WINDOW_TOKENS", 20000):
-            result = self.prepare(messages)
+        self.compactor.context_window_tokens = 20000
+        result = self.prepare(messages)
         self.assertEqual(self.client.calls, [])
         self.assertLess(estimate_request_tokens("system", result, []) + 500, 18000)
         self.assertNotEqual(result[2], before[2])
@@ -246,8 +249,8 @@ class CompactTests(IsolatedTestCase):
     def test_prepare_summarizes_after_old_result_previews_are_insufficient(self):
         messages = self.history()
         before = copy.deepcopy(messages)
-        with patch("CodingAgent.compact.CONTEXT_WINDOW_TOKENS", 14000):
-            result = self.prepare(messages)
+        self.compactor.context_window_tokens = 14000
+        result = self.prepare(messages)
         self.assertEqual(len(self.client.calls), 1)
         self.assertLess(estimate_request_tokens("system", result, []) + 500, 12600)
         self.assertEqual(result[1:], before[-6:])
@@ -258,9 +261,9 @@ class CompactTests(IsolatedTestCase):
     def test_failed_prepare_preserves_history_even_after_tool_shortening(self):
         messages = self.history()
         before = copy.deepcopy(messages)
-        with patch("CodingAgent.compact.CONTEXT_WINDOW_TOKENS", 20000):
-            with self.assertRaisesRegex(ContextBudgetError, "压缩后预计请求仍超过预算"):
-                self.prepare(messages, system="!" * 20000)
+        self.compactor.context_window_tokens = 20000
+        with self.assertRaisesRegex(ContextBudgetError, "压缩后预计请求仍超过预算"):
+            self.prepare(messages, system="!" * 20000)
         self.assertEqual(len(self.client.calls), 1)
         self.assertTrue(list(self.compactor.tool_results_dir.glob("*.txt")))
         self.assertEqual(messages, before)

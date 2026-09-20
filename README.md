@@ -8,14 +8,14 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 文件操作 | 分页读取文件、写入文件、替换文本、匹配路径 |
+| 文件操作 | 分页读取文件、写入文件、替换文本、按路径名匹配（glob）、按字面文本搜索内容（grep） |
 | 命令执行 | 运行 Shell 命令，支持后台执行并回收结果 |
 | 任务看板 | 创建、更新、认领和完成任务，管理任务依赖 |
 | 只读子 Agent | 独立上下文、受控并发、运行预算、状态查询、取消和结果交接 |
 | Skill | 扫描本地技能清单，按需加载具体指令 |
 | MCP | 按需连接 stdio / HTTP 服务，发现并调用外部工具 |
 | Memory | 使用本地文件保存记忆，支持索引、召回、提取与合并 |
-| Compact | 裁剪和归档历史消息、处理超长工具结果、生成上下文摘要 |
+| Compact | 按请求 token 粗估压缩：先缩短旧工具结果，必要时归档并摘要旧历史 |
 | Hooks 与权限 | 在用户输入、工具执行和任务结束时触发处理，支持拒绝规则与操作确认 |
 
 ## 架构设计
@@ -25,7 +25,7 @@
 ```mermaid
 flowchart TD
     Input[用户输入] --> Loop[主 Agent 循环]
-    Context[提示词 / Skill 清单 / Memory / Compact] --> Loop
+    Context[提示词 / AGENT.md / Skill 清单 / Memory / Compact] --> Loop
     Loop --> Model[模型]
     Model --> Decision{是否调用工具}
     Decision -->|是| Dispatch[工具分发 / Hooks / 权限检查]
@@ -43,7 +43,7 @@ flowchart TD
     Finish -->|完成| Reply[回复用户]
 ```
 
-**主 Agent 与子 Agent 的分工**：主 Agent 可以修改文件和执行命令；子 Agent 通过工具白名单限制为 `read_file`、`glob`、`load_skill`，适合代码调查和审查，不负责写代码或运行测试。默认最多同时运行 4 个子 Agent，上限在 `CodingAgent/config.py` 的 `AgentConfig.max_subagents` 中配置。
+**主 Agent 与子 Agent 的分工**：主 Agent 可以修改文件和执行命令；子 Agent 通过工具白名单限制为 `read_file`、`glob`、`grep`、`load_skill`，适合代码调查和审查，不负责写代码或运行测试。默认最多同时运行 4 个子 Agent，上限在 `CodingAgent/config.py` 的 `AgentConfig.max_subagents` 中配置。上下文窗口默认 1,000,000 token，压缩约在窗口的 90% 触发，对应同一文件中的 `AgentConfig.context_window_tokens`。
 
 **任务与运行的区别**：`task_id` 标识看板中的任务，`run_id` 标识一次子 Agent 运行。主 Agent 先创建并认领任务，再通过 `task` 工具启动子 Agent。启动回执立即返回，最终结果通过 `subagent_result` 交回主循环，由主 Agent 验证和整合。
 
@@ -56,6 +56,8 @@ mini-coding-agent/
 ├── main.py                  # 入口、依赖组装、主循环、统一退出
 ├── CodingAgent/
 │   ├── config.py            # 配置与工作目录派生路径
+│   ├── context_budget.py    # 请求 token 粗估与压缩触发比例
+│   ├── project_instructions.py  # 读取工作目录 AGENT.md
 │   ├── prompts.py           # 主 Agent / 子 Agent 提示词
 │   ├── messages.py          # 消息文本提取
 │   ├── skill_loader.py      # Skill 扫描与加载
@@ -74,6 +76,8 @@ mini-coding-agent/
 │   ├── mcp/                 # 配置、异步桥接、客户端、工具管理
 │   ├── memory/              # 记忆存储与管理
 │   └── todo.py              # 保留早期 TODO 实现，当前使用 Task 看板
+├── tests/                   # 离线单元测试，说明见 tests/README.md
+├── experiments/             # 真实模型任务评测，说明见 experiments/README.md
 └── skills/
     ├── count_lines/SKILL.md
     └── python_file_summary/SKILL.md
@@ -181,12 +185,13 @@ printf '%s\n' '{"mcpServers": {}}' > mcp.json
 "$agent_repo/.venv/bin/python" -B -u "$agent_repo/main.py"
 ```
 
-对于已有项目，将上述创建目录步骤替换为切换到目标目录，并按需准备 `skills/` 和 `mcp.json` 即可。改变工作目录不会自动复制这些配置。
+对于已有项目，将上述创建目录步骤替换为切换到目标目录，并按需准备 `skills/`、`mcp.json` 和可选的 `AGENT.md` 即可。改变工作目录不会自动复制这些配置。
 
 运行时数据按需生成在工作目录中：
 
 | 路径 | 用途 |
 | --- | --- |
+| `AGENT.md` | 可选项目约定，启动时读入主 Agent 与子 Agent 提示词；缺失或空白则跳过 |
 | `skills/*/SKILL.md` | 技能清单与指令 |
 | `mcp.json` | MCP 服务器配置 |
 | `tasks/` | Task 看板记录 |
@@ -270,5 +275,8 @@ Agent 通过 `connect_mcp` 按需连接服务器，发现工具后加入后续�
 
 - 主 Agent 可以修改文件和执行命令。权限规则提供部分操作检查，不构成操作系统沙箱；在重要项目中使用前应保存版本或备份。
 - Windows 下名为 `bash` 的工具实际使用系统默认 Shell，通常按 `cmd.exe` 语法执行；需要 PowerShell 时应显式调用。Linux / macOS 的命令语法由系统 Shell 决定。
+- `grep` 调用本机 `rg`（ripgrep），按字面文本搜索，不是正则。未安装或未加入 PATH 时该工具会报错，不会改用 Python 搜索。
+- 工作目录根的 `AGENT.md` 在启动时读取一次。用户当前请求优先于其中的项目约定；该文件不会在会话中自动重载。
 - 任务看板和记忆有文件存储，但交互会话历史及运行中的线程状态不会在重启后自动恢复。
 - 当前运行验证主要在 Windows / Python 3.11 下进行。Linux / macOS 的安装命令供使用参考，仍需在目标平台验证完整开发流程。
+- 离线单元测试见 `tests/README.md`。真实模型评测见 `experiments/README.md`；评测会调用配置的模型并产生费用。

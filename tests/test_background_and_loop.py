@@ -14,8 +14,11 @@ from CodingAgent.tools.files import FileTools
 from CodingAgent.tools.shell import ShellRunner
 from CodingAgent.compact import ContextCompactor
 from CodingAgent.context_budget import (
-    CONTEXT_WINDOW_TOKENS, ContextBudgetError, estimate_request_tokens,
+    ContextBudgetError, estimate_request_tokens,
 )
+from CodingAgent.subagent.results import format_subagent_result
+from CodingAgent.subagent.state import SubagentState
+from CodingAgent.tools.adapters import SubagentTools
 from tests.helpers import (
     IsolatedTestCase, ScriptedClient, load_main_functions,
     text_response, tool_call, tool_response,
@@ -160,7 +163,7 @@ class MainLoopTests(IsolatedTestCase):
         namespace = {
             "client": client, "MODEL": "offline-model", "WORKDIR": self.workdir,
             "MAX_SUBAGENTS": 4, "MAX_REACTIVE_RETRIES": 1,
-            "CONTEXT_WINDOW_TOKENS": CONTEXT_WINDOW_TOKENS,
+            "CONFIG": SimpleNamespace(context_window_tokens=1_000_000),
             "ContextBudgetError": ContextBudgetError,
             "estimate_request_tokens": estimate_request_tokens,
             "input": Mock(side_effect=AssertionError("Unexpected interactive prompt")),
@@ -367,6 +370,7 @@ class MainLoopTests(IsolatedTestCase):
         ns["COMPACTOR"] = ContextCompactor(
             summary_client, "offline-model", self.workdir / "transcripts",
             self.workdir / "outputs",
+            context_window_tokens=1_000_000,
         )
         ns["TOOL_HANDLERS"]["read_file"] = Mock(return_value="evidence" * 300)
         ns["TOOL_HANDLERS"]["compact"] = Mock(return_value="Compact requested")
@@ -396,10 +400,6 @@ class MainLoopTests(IsolatedTestCase):
         ns["MEMORY_MANAGER"].extract_memories.assert_not_called()
     
     def test_subagent_counts_are_deduplicated_and_scoped(self):
-        from CodingAgent.subagent.state import SubagentState
-        from CodingAgent.subagent.results import format_subagent_result
-        from CodingAgent.tools.adapters import SubagentTools
-
         states = []
 
         for status, count in (

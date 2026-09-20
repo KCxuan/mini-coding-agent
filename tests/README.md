@@ -33,7 +33,7 @@ $LASTEXITCODE
 
 最后一行应紧接测试命令执行，用来读取退出码：0 表示成功，非 0 表示失败或错误。
 
-当前静态统计为 **119 个 test_ 方法**。部分方法通过 subTest 检查多个输入，
+当前静态统计为 **121 个 test_ 方法**。部分方法通过 subTest 检查多个输入，
 这些输入不另算独立测试方法。没有 skip 或 expectedFailure 标记。
 先确认实际发现了测试，再看结尾的 OK / FAILED；Ran 0 tests 不算验收成功。
 
@@ -54,12 +54,12 @@ OK
 
 | 模块 | 方法数 | 验证内容 |
 | --- | ---: | --- |
-| tests.test_files | 11 | 分页、EOF、非法参数、写入与编辑结果、越界路径、glob |
+| tests.test_files | 11 | 分页、EOF、非法参数、写入与编辑结果、越界路径、glob（不含 grep/ripgrep） |
 | tests.test_taskboard | 10 | 依赖阻塞与解锁、循环依赖、认领、完成、持久化重载 |
-| tests.test_subagent_executor | 14 | 只读限制、工具证据、取消、轮数耗尽、超时、截断与总结失败 |
+| tests.test_subagent_executor | 15 | 只读限制、工具证据、取消、轮数耗尽、超时、截断与总结失败、Stop 钩子收到工具计数 |
 | tests.test_subagent_manager | 9 | 四个名额、同时抢占、结果只收一次、取消隔离、线程失败和关闭 |
-| tests.test_background_and_loop | 24 | 后台全文与首尾预览、投递时机、响应重试、60 轮续跑、压缩后工具计数 |
-| tests.test_compact | 23 | 原文归档、首尾预览、完整工具交互、重复压缩、预算边界和失败保留历史 |
+| tests.test_background_and_loop | 25 | 后台全文与首尾预览、投递时机、响应重试、60 轮续跑、压缩后工具计数、本轮子 Agent 计数去重 |
+| tests.test_compact | 23 | 原文归档、首尾预览、完整工具交互、重复压缩、实例窗口预算边界和失败保留历史 |
 | tests.test_context_budget | 4 | SDK 对象序列化、system/tools/思考/工具结果计入粗估、不支持的对象报错 |
 | tests.test_memory | 11 | 索引、有效性、去重、临时记忆拒绝、召回降级、合并恢复 |
 | tests.test_mcp | 13 | 配置、工具名冲突、路由绑定、权限策略、连接故障与清理 |
@@ -88,6 +88,7 @@ OK
 - MCP 服务和 Shell 由替身代替，不启动外部服务或运行 Shell 命令。
   测试期间另拦截常用 socket 连接入口和 subprocess.Popen，发现误调用就报错。
   这是防止测试误用外部依赖的措施，不是系统级安全沙箱。
+  因此这套离线测试不覆盖 `grep`（它会调用本机 ripgrep）。
 - 并发测试创建真实 Python 线程，通过事件控制执行结束时机，清理时等待线程退出。
   等待有上限；机器负载过高也可能导致超时，需结合错误分析。
 - 主循环测试从当前 main.py 提取 agent_loop、inject_async_results、响应校验、
@@ -102,6 +103,7 @@ OK
 - token 测试验证本地估算包含哪些内容，不验证估算与服务端 tokenizer 的误差。
   摘要响应是预设文本，测试通过不代表真实模型一定能保留所有需求或推理细节。
 - 当前压缩测试验证“本轮请求原文 + 旧历史摘要 + 最近完整交互”。
+  压缩窗口由 `ContextCompactor` 构造参数注入，边界用例改实例上的 `context_window_tokens`。
   不声称会话第一条用户消息永远原样保留，也不声称已实现超大历史的分段总结。
 
 ## 5. 学习顺序和结果记录
@@ -127,4 +129,4 @@ $testExitCode = $LASTEXITCODE
 保留多次实验记录时请更换文件名。分享失败信息时保留 traceback 和命令。
 
 完成离线测试后，再设计单独的真实任务评测集，统计编程任务成功率和模型用量。
-不要把“119 条测试通过”写成“119 个编程任务完成”。
+不要把“121 条测试通过”写成“121 个编程任务完成”。

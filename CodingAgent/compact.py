@@ -6,7 +6,6 @@ from uuid import uuid4
 from copy import deepcopy
 
 from .context_budget import (
-    CONTEXT_WINDOW_TOKENS,
     COMPACT_TRIGGER_RATIO,
     ContextBudgetError,
     dump_json,
@@ -33,11 +32,19 @@ class ContextCompactor:
         "Later user corrections supersede conflicting earlier requests."
     )
 
-    def __init__(self, llm_client, model: str, transcript_dir: Path, tool_results_dir: Path):
+    def __init__(
+        self, llm_client, model: str, transcript_dir: Path, tool_results_dir: Path,
+        *,
+        context_window_tokens: int,
+        compact_trigger_ratio: float = COMPACT_TRIGGER_RATIO,
+    ):
         self.client = llm_client
         self.model = model
         self.transcript_dir = transcript_dir
         self.tool_results_dir = tool_results_dir
+
+        self.context_window_tokens = context_window_tokens
+        self.compact_trigger_ratio = compact_trigger_ratio
     
     @staticmethod
     def estimate_chars(messages: list[dict]) -> int:
@@ -310,7 +317,7 @@ class ContextCompactor:
         )
 
         limit = int(
-            CONTEXT_WINDOW_TOKENS * COMPACT_TRIGGER_RATIO
+            self.context_window_tokens * self.compact_trigger_ratio
         )
 
         if estimated + self.SUMMARY_OUTPUT_TOKENS >= limit:
@@ -413,7 +420,7 @@ class ContextCompactor:
         output_reserve,
     ):
         limit = int(
-            CONTEXT_WINDOW_TOKENS * COMPACT_TRIGGER_RATIO
+            self.context_window_tokens * self.compact_trigger_ratio
         )
 
         if not 0 <= output_reserve < limit:
