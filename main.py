@@ -62,6 +62,12 @@ from CodingAgent.tools.schemas import build_tool_schemas
 from CodingAgent.tools.adapters import SubagentTools, run_compact
 from CodingAgent.tools.dispatcher import ToolDispatcher
 
+from CodingAgent.context_budget import (
+    CONTEXT_WINDOW_TOKENS,
+    ContextBudgetError,
+    estimate_request_tokens,
+)
+
 dotenv.load_dotenv()
 CONFIG = load_config()
 
@@ -455,7 +461,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
         rounds_used += 1
 
         inject_async_results(messages) # 将背景任务以及子Agent的结果注入到messages中，大模型会根据这些结果继续推理
-        messages[:] = COMPACTOR.prepare(messages, active_request)
+        # messages[:] = COMPACTOR.prepare(messages, active_request)
         system_prompt = build_system_prompt(
             workdir=WORKDIR,
             max_subagents=MAX_SUBAGENTS,
@@ -469,12 +475,44 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             builtin_tools=TOOLS,
             builtin_handlers=TOOL_HANDLERS,
         )
+
+        # 预留较大的输出额度，让截断后的重试也有空间。
+        output_reserve = max(
+            MAIN_OUTPUT_TOKENS,
+            MAIN_RETRY_OUTPUT_TOKENS,
+        )
+
+        messages[:] = COMPACTOR.prepare(
+            messages,
+            active_request,
+            system_prompt=system_prompt,
+            tools=tools,
+            output_reserve=output_reserve,
+        )
+
+        estimated = estimate_request_tokens(
+            system_prompt,
+            messages,
+            tools,
+        )
+
+        print(
+            f"[context] 输入约 {estimated:,} token；"
+            f"含输出预留约占 "
+            f"{(estimated + output_reserve) / CONTEXT_WINDOW_TOKENS:.1%}"
+        )
+
         try:
             response = request_usable_response(
                 messages=messages,
                 system_prompt=system_prompt,
                 tools=tools,
             )
+
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                print(f"[usage 原始统计] {usage}")
+
             reactive_retries = 0
         except Exception as error:
             too_long = any(text in str(error).lower()
@@ -683,7 +721,7 @@ if __name__ == "__main__":
                     if getattr(block, "type", None) == "text":# print the model's final text response
                         print(block.text)
             print()
-    except (IncompleteResponseError, AgentRoundLimitError) as error:
+    except (IncompleteResponseError, AgentRoundLimitError, ContextBudgetError) as error:
         print(f"\n[未完成] {error}")
         print(
             "当前程序将退出并执行清理。"

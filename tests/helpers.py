@@ -82,18 +82,30 @@ class ScriptedClient:
 
 
 def load_main_functions(namespace, *names):
-    """从当前 main.py 提取原函数 AST，避开顶层客户端/信号/atexit 初始化。
+    """提取明确列出的函数、异常类和常量，避开顶层初始化。
 
     这是主循环逻辑的隔离测试，不是 CLI 启动测试。函数体来自磁盘，
     没有维护另一份 agent_loop；依赖由每个测试显式传入。
     """
     path = Path(__file__).resolve().parents[1] / "main.py"
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    nodes = [node for node in tree.body
-             if isinstance(node, ast.FunctionDef) and node.name in names]
-    found = {node.name for node in nodes}
+    nodes = []
+    found = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
+            nodes.append(node)
+            found.add(node.name)
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+              and isinstance(node.targets[0], ast.Name)
+              and node.targets[0].id in names):
+            # 不允许常量表达式顺便执行客户端构造或其他函数调用。
+            allowed = (ast.Constant, ast.BinOp, ast.UnaryOp, ast.operator, ast.unaryop)
+            if not all(isinstance(part, allowed) for part in ast.walk(node.value)):
+                raise AssertionError(f"Not a literal constant: {node.targets[0].id}")
+            nodes.append(node)
+            found.add(node.targets[0].id)
     if found != set(names):
-        raise AssertionError(f"main.py missing functions: {set(names) - found}")
+        raise AssertionError(f"main.py missing definitions: {set(names) - found}")
     module = ast.Module(body=nodes, type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
     return namespace

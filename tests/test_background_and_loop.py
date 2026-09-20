@@ -1,6 +1,8 @@
 """后台通知与主循环集成；不导入会初始化真实客户端的 main 模块。"""
 
 import threading
+import xml.etree.ElementTree as ET
+from pathlib import Path
 from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -9,6 +11,11 @@ from CodingAgent.background import BackgroundManager
 from CodingAgent.hooks import HookRegistry
 from CodingAgent.tools.dispatcher import ToolDispatcher
 from CodingAgent.tools.files import FileTools
+from CodingAgent.tools.shell import ShellRunner
+from CodingAgent.compact import ContextCompactor
+from CodingAgent.context_budget import (
+    CONTEXT_WINDOW_TOKENS, ContextBudgetError, estimate_request_tokens,
+)
 from tests.helpers import (
     IsolatedTestCase, ScriptedClient, load_main_functions,
     text_response, tool_call, tool_response,
@@ -16,6 +23,12 @@ from tests.helpers import (
 
 
 class BackgroundTests(IsolatedTestCase):
+    def shell(self):
+        # 只替换命令执行；归档和预览运行真实实现。
+        shell = ShellRunner(self.workdir)
+        shell.run_bash_process = Mock()
+        return shell
+
     def start_and_finish(self, shell):
         manager = BackgroundManager(shell)
         threads = []
@@ -34,7 +47,7 @@ class BackgroundTests(IsolatedTestCase):
         return manager, task_id
 
     def test_success_result_is_injected_once(self):
-        shell = Mock()
+        shell = self.shell()
         shell.run_bash_process.return_value = ("all checks passed", 0)
         manager, task_id = self.start_and_finish(shell)
         messages = [{"role": "assistant", "content": []}]
@@ -50,7 +63,7 @@ class BackgroundTests(IsolatedTestCase):
     def test_nonzero_exit_and_shell_exception_are_failures(self):
         for failure in (False, True):
             with self.subTest(exception=failure):
-                shell = Mock()
+                shell = self.shell()
                 if failure:
                     shell.run_bash_process.side_effect = RuntimeError("fake failure")
                 else:
@@ -62,7 +75,7 @@ class BackgroundTests(IsolatedTestCase):
                 self.assertEqual(manager.collect(), [])
 
     def test_injection_preserves_existing_user_content(self):
-        shell = Mock()
+        shell = self.shell()
         shell.run_bash_process.return_value = ("done", 0)
         manager, _ = self.start_and_finish(shell)
         messages = [{"role": "user", "content": "original request"}]
@@ -91,6 +104,32 @@ class BackgroundTests(IsolatedTestCase):
         background.start.assert_called_once_with(block)
         handler.assert_not_called()
 
+    def test_long_output_notification_preserves_full_text_and_head_tail(self):
+        shell = self.shell()
+        full = "HEAD<&>\r\n" + "中文 evidence\r\n" * 1000 + "TAIL_SENTINEL"
+        shell.run_bash_process.return_value = (full, 0)
+        manager, _ = self.start_and_finish(shell)
+        notice = ET.fromstring(manager.collect()[0])
+        preview = notice.findtext("summary")
+        self.assertIn("HEAD<&>", preview)
+        self.assertIn("TAIL_SENTINEL", preview)
+        self.assertLessEqual(len(preview), 500)
+        self.assertEqual(Path(notice.findtext("full_output")).read_bytes(), full.encode("utf-8"))
+        self.assertEqual(notice.findtext("exit_code"), "0")
+        self.assertEqual(manager.collect(), [])
+
+    def test_archive_failure_delivers_full_output_without_fake_path(self):
+        shell = self.shell()
+        full = "COMPLETE_EVIDENCE" * 1000
+        shell.run_bash_process.return_value = (full, 0)
+        manager, _ = self.start_and_finish(shell)
+        with patch("CodingAgent.tools.shell.Path.open", side_effect=OSError("disk full")):
+            notice = ET.fromstring(manager.collect()[0])
+        self.assertIsNone(notice.find("full_output"))
+        self.assertIn(full, notice.findtext("summary"))
+        self.assertIn("output archive failed", notice.findtext("summary"))
+        self.assertEqual(manager.collect(), [])
+
 
 class MainLoopTests(IsolatedTestCase):
     def namespace(self, client):
@@ -104,8 +143,8 @@ class MainLoopTests(IsolatedTestCase):
         memory = Mock()
         memory.load_memories.return_value = ""
         memory.extract_memories.return_value = 0
-        compactor = Mock()
-        compactor.prepare.side_effect = lambda messages, request: messages
+        compactor = Mock(spec=ContextCompactor)
+        compactor.prepare.side_effect = lambda messages, request, **kwargs: messages
         compactor.reactive_compact.side_effect = lambda messages, request: messages
         mcp = Mock()
         mcp.assemble_tool_pool.side_effect = lambda **kwargs: ([], kwargs["builtin_handlers"])
@@ -121,6 +160,10 @@ class MainLoopTests(IsolatedTestCase):
         namespace = {
             "client": client, "MODEL": "offline-model", "WORKDIR": self.workdir,
             "MAX_SUBAGENTS": 4, "MAX_REACTIVE_RETRIES": 1,
+            "CONTEXT_WINDOW_TOKENS": CONTEXT_WINDOW_TOKENS,
+            "ContextBudgetError": ContextBudgetError,
+            "estimate_request_tokens": estimate_request_tokens,
+            "input": Mock(side_effect=AssertionError("Unexpected interactive prompt")),
             "BACKGROUND": background, "SUBAGENTS": subagents,
             "SUBAGENT_TOOLS": subagent_tools, "MEMORY_MANAGER": memory,
             "MEMORY_STORE": Mock(), "SKILL_LOADER": Mock(), "COMPACTOR": compactor,
@@ -129,7 +172,12 @@ class MainLoopTests(IsolatedTestCase):
             "build_system_prompt": lambda **kwargs: "offline prompt",
             "time": SimpleNamespace(sleep=bounded_sleep), "test_sleeps": sleeps,
         }
-        return load_main_functions(namespace, "agent_loop", "inject_async_results")
+        return load_main_functions(
+            namespace, "agent_loop", "inject_async_results", "request_usable_response",
+            "confirm_more_rounds", "IncompleteResponseError", "AgentRoundLimitError",
+            "MAIN_OUTPUT_TOKENS", "MAIN_RETRY_OUTPUT_TOKENS", "MAX_RESPONSE_RETRIES",
+            "AGENT_ROUND_BATCH",
+        )
 
     def test_tool_result_id_and_content_reach_following_model_request(self):
         (self.workdir / "sample.txt").write_text("loop evidence", encoding="utf-8")
@@ -197,3 +245,150 @@ class MainLoopTests(IsolatedTestCase):
         with self.assertRaisesRegex(RuntimeError, "authentication failed"):
             ns["agent_loop"]([{"role": "user", "content": "Read"}], "Read")
         ns["COMPACTOR"].reactive_compact.assert_not_called()
+
+    def test_prepare_receives_actual_system_tools_and_retry_reserve(self):
+        client = ScriptedClient(text_response("done"))
+        ns = self.namespace(client)
+        tools = [{"name": "read_file", "input_schema": {"type": "object"}}]
+        ns["MCP_MANAGER"].assemble_tool_pool.side_effect = None
+        ns["MCP_MANAGER"].assemble_tool_pool.return_value = (tools, ns["TOOL_HANDLERS"])
+        ns["agent_loop"]([{"role": "user", "content": "Read"}], "Read")
+        kwargs = ns["COMPACTOR"].prepare.call_args.kwargs
+        self.assertEqual(kwargs["system_prompt"], client.calls[0]["system"])
+        self.assertEqual(kwargs["tools"], client.calls[0]["tools"])
+        self.assertEqual(kwargs["output_reserve"], ns["MAIN_RETRY_OUTPUT_TOKENS"])
+
+    def test_truncated_tool_call_is_discarded_before_retry(self):
+        partial = tool_response(tool_call("read_file", call_id="partial"), stop_reason="max_tokens")
+        client = ScriptedClient(partial, text_response("done"))
+        ns = self.namespace(client)
+        handler = Mock(return_value="must not run")
+        ns["TOOL_HANDLERS"]["read_file"] = handler
+        messages = [{"role": "user", "content": "Read"}]
+        ns["agent_loop"](messages, "Read")
+        handler.assert_not_called()
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["messages"], client.calls[1]["messages"])
+        self.assertEqual(client.calls[0]["max_tokens"], ns["MAIN_OUTPUT_TOKENS"])
+        self.assertEqual(client.calls[1]["max_tokens"], ns["MAIN_RETRY_OUTPUT_TOKENS"])
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[-1]["content"][0].text, "done")
+
+    def test_repeated_truncation_raises_without_normal_finish(self):
+        client = ScriptedClient(
+            text_response("partial", stop_reason="max_tokens"),
+            text_response("still partial", stop_reason="max_tokens"),
+        )
+        ns = self.namespace(client)
+        messages = [{"role": "user", "content": "Read"}]
+        with self.assertRaises(ns["IncompleteResponseError"]):
+            ns["agent_loop"](messages, "Read")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(messages, [{"role": "user", "content": "Read"}])
+        ns["MEMORY_MANAGER"].extract_memories.assert_not_called()
+
+    def test_empty_or_thinking_only_response_retries_without_raising_output_limit(self):
+        from tests.helpers import Block
+        bad_responses = [
+            text_response("   "),
+            SimpleNamespace(content=[], stop_reason="end_turn"),
+            SimpleNamespace(content=[Block(type="thinking", thinking="reasoning")],
+                            stop_reason="end_turn"),
+            text_response("no tool", stop_reason="tool_use"),
+        ]
+        for bad in bad_responses:
+            with self.subTest(response=bad):
+                client = ScriptedClient(bad, text_response("done"))
+                ns = self.namespace(client)
+                ns["agent_loop"]([{"role": "user", "content": "Read"}], "Read")
+                self.assertEqual(len(client.calls), 2)
+                self.assertEqual(client.calls[0]["max_tokens"], client.calls[1]["max_tokens"])
+
+    def test_unknown_stop_reason_or_conflicting_tool_response_fails_immediately(self):
+        for response in (text_response("text", stop_reason="unknown"),
+                         tool_response(tool_call(), stop_reason="end_turn")):
+            with self.subTest(response=response):
+                client = ScriptedClient(response)
+                ns = self.namespace(client)
+                with self.assertRaises(ns["IncompleteResponseError"]):
+                    ns["agent_loop"]([{"role": "user", "content": "Read"}], "Read")
+                self.assertEqual(len(client.calls), 1)
+                ns["MEMORY_MANAGER"].extract_memories.assert_not_called()
+
+    def test_round_60_requires_permission_before_request_61(self):
+        client = ScriptedClient(*(text_response("pending") for _ in range(60)))
+        ns = self.namespace(client)
+        self.assertEqual(ns["AGENT_ROUND_BATCH"], 60)
+        ns["HOOKS"].register("Stop", lambda messages, count: "Continue checking")
+        ns["input"] = Mock(return_value="n")
+        with self.assertRaisesRegex(ns["AgentRoundLimitError"], "60"):
+            ns["agent_loop"]([{"role": "user", "content": "Review"}], "Review")
+        self.assertEqual(len(client.calls), 60)
+        ns["input"].assert_called_once()
+        ns["MEMORY_MANAGER"].extract_memories.assert_not_called()
+
+    def test_accepting_extension_allows_120_rounds_then_asks_again(self):
+        client = ScriptedClient(*(text_response("pending") for _ in range(120)))
+        ns = self.namespace(client)
+        ns["HOOKS"].register("Stop", lambda messages, count: "Continue checking")
+        ns["input"] = Mock(side_effect=["yes", "no"])
+        with self.assertRaisesRegex(ns["AgentRoundLimitError"], "120"):
+            ns["agent_loop"]([{"role": "user", "content": "Review"}], "Review")
+        self.assertEqual(len(client.calls), 120)
+        self.assertEqual(ns["input"].call_count, 2)
+
+    def test_finishing_on_round_60_does_not_ask_for_extension(self):
+        client = ScriptedClient(*(text_response("pending") for _ in range(60)))
+        ns = self.namespace(client)
+        ns["HOOKS"].register("Stop", Mock(side_effect=["Continue"] * 59 + [None]))
+        ns["agent_loop"]([{"role": "user", "content": "Review"}], "Review")
+        self.assertEqual(len(client.calls), 60)
+        ns["input"].assert_not_called()
+        ns["MEMORY_MANAGER"].extract_memories.assert_called_once()
+
+    def test_confirmation_reprompts_invalid_answer_and_declines_eof(self):
+        ns = self.namespace(ScriptedClient())
+        ns["input"] = Mock(side_effect=["perhaps", " Y "])
+        self.assertTrue(ns["confirm_more_rounds"](60))
+        self.assertEqual(ns["input"].call_count, 2)
+        ns["input"] = Mock(side_effect=EOFError)
+        self.assertFalse(ns["confirm_more_rounds"](60))
+
+    def test_tool_count_survives_real_compaction_and_resets_for_next_request(self):
+        client = ScriptedClient(
+            *(tool_response(tool_call(call_id=f"read_{i}")) for i in range(8)),
+            tool_response(tool_call("compact", {}, call_id="compact_1")),
+            text_response("done"), text_response("next task done"),
+        )
+        ns = self.namespace(client)
+        summary_client = ScriptedClient(text_response("Read files; all evidence saved."))
+        ns["COMPACTOR"] = ContextCompactor(
+            summary_client, "offline-model", self.workdir / "transcripts",
+            self.workdir / "outputs",
+        )
+        ns["TOOL_HANDLERS"]["read_file"] = Mock(return_value="evidence" * 300)
+        ns["TOOL_HANDLERS"]["compact"] = Mock(return_value="Compact requested")
+        counts = []
+        ns["HOOKS"].register("Stop", lambda messages, count: counts.append(count))
+        messages = [{"role": "user", "content": "Read"}]
+        ns["agent_loop"](messages, "Read")
+        self.assertEqual(len(summary_client.calls), 1)
+        self.assertEqual(counts, [9])
+        remaining_calls = sum(
+            getattr(block, "type", None) == "tool_use"
+            for message in messages if isinstance(message["content"], list)
+            for block in message["content"]
+        )
+        self.assertLess(remaining_calls, counts[0])
+        messages.append({"role": "user", "content": "Next task"})
+        ns["agent_loop"](messages, "Next task")
+        self.assertEqual(counts, [9, 0])
+
+    def test_context_budget_failure_stops_before_model_call(self):
+        client = ScriptedClient()
+        ns = self.namespace(client)
+        ns["COMPACTOR"].prepare.side_effect = ContextBudgetError("request cannot fit")
+        with self.assertRaises(ContextBudgetError):
+            ns["agent_loop"]([{"role": "user", "content": "Read"}], "Read")
+        self.assertEqual(client.calls, [])
+        ns["MEMORY_MANAGER"].extract_memories.assert_not_called()
