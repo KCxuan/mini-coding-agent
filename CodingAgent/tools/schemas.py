@@ -97,6 +97,55 @@ BASE_TOOLS = [
         }
     },
     {
+        "name": "grep",
+        "description": (
+            "Search file contents within the working directory. "
+            "pattern is literal single-line text, not a regular expression. "
+            "Returns matching file paths, 1-based line numbers, and line previews. "
+            "Use read_file to inspect surrounding code or full long lines. "
+            "Search is case-sensitive unless ignore_case is true. "
+            "Default ripgrep filtering applies; glob can override ignore rules. "
+            "If results are truncated, narrow the scope or search text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Literal single-line text to search for.",
+                },
+                "path": {
+                    "type": "string",
+                    "default": ".",
+                    "description": (
+                        "A file or directory within the working directory."
+                    ),
+                },
+                "glob": {
+                    "type": ["string", "null"],
+                    "default": None,
+                    "description": (
+                        "Optional file filter, for example *.py or *.md."
+                    ),
+                },
+                "ignore_case": {
+                    "type": "boolean",
+                    "default": False,
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 100,
+                    "description": "Maximum number of matching lines returned.",
+                },
+            },
+            "required": ["pattern"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "load_skill",
         "description": "Load a skill from the skills directory",
         "input_schema": {

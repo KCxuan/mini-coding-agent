@@ -26,6 +26,7 @@ SUB_READONLY_TOOL_NAMES = frozenset({
     "read_file",
     "glob",
     "load_skill",
+    "grep",
 })
 
 class SubagentExecutor:
@@ -107,6 +108,7 @@ class SubagentExecutor:
         handlers = {
             "read_file": bounded_handler(self.files.run_read_file),
             "glob": bounded_handler(self.run_subagent_glob),
+            "grep": bounded_handler(self.files.run_grep),
             "load_skill": bounded_handler(self.skill_loader.load),
         }
 
@@ -158,6 +160,7 @@ class SubagentExecutor:
                     force = self.hooks.trigger(
                         "Stop",
                         state.messages,
+                        state.tool_call_count,
                     )
 
                     if force:
@@ -196,6 +199,8 @@ class SubagentExecutor:
 
                 for tool_call in tool_calls:
                     remaining_seconds()
+
+                    state.tool_call_count += 1
 
                     output = self.execute_subagent_tool(
                         tool_call,

@@ -10,7 +10,7 @@ try:
     import readline
 except ImportError:
     pass
-
+import json
 
 # ----------------------------------------------------
 
@@ -67,11 +67,13 @@ from CodingAgent.context_budget import (
     ContextBudgetError,
     estimate_request_tokens,
 )
+from CodingAgent.project_instructions import load_project_instructions
 
 dotenv.load_dotenv()
 CONFIG = load_config()
 
 WORKDIR = CONFIG.workdir
+PROJECT_INSTRUCTIONS = load_project_instructions(WORKDIR)
 SKILLS_DIR = CONFIG.skills_dir
 TRANSCRIPT_DIR = CONFIG.transcript_dir
 TOOL_RESULTS_DIR = CONFIG.tool_results_dir
@@ -93,7 +95,7 @@ MAX_SUBAGENTS = CONFIG.max_subagents
 # -------------- 技能加载器 --------------
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
-SUB_SYSTEM_PROMPT = build_subagent_prompt(WORKDIR, SKILL_LOADER.catalog())
+SUB_SYSTEM_PROMPT = build_subagent_prompt(WORKDIR, SKILL_LOADER.catalog(), project_instructions=PROJECT_INSTRUCTIONS)
 
 # 定义工具列表
 
@@ -177,12 +179,14 @@ FILES = FileTools(WORKDIR)
 # -----------------定义异步结果注入函数-----------------
 def inject_async_results(
     messages: list[dict],
+    subagent_tool_counts: dict[str, int] | None = None,
 ) -> int:
     shell_count = BACKGROUND.inject_background_results(
         messages
     )
     subagent_count = SUBAGENT_TOOLS.inject_subagent_results(
-        messages
+        messages,
+        tool_counts=subagent_tool_counts,
     )
 
     return shell_count + subagent_count
@@ -285,6 +289,7 @@ TOOL_HANDLERS = {
     "write_file": FILES.run_write_file,
     "edit_file": FILES.run_edit_file,
     "glob": FILES.run_glob,
+    "grep": FILES.run_grep,
     "load_skill": SKILL_LOADER.load,
 
     "create_task": TASK_BOARD.run_create_task,
@@ -443,6 +448,9 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
     # 用户本次循环的工具调用次数
     tool_call_count = 0
 
+    # 只保存本轮启动的子Agent 键为run_id
+    subagent_tool_counts: dict[str, int] = {}
+
     relevant = MEMORY_MANAGER.load_memories(messages)
     
     while True:
@@ -460,7 +468,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             )
         rounds_used += 1
 
-        inject_async_results(messages) # 将背景任务以及子Agent的结果注入到messages中，大模型会根据这些结果继续推理
+        inject_async_results(messages, subagent_tool_counts) # 将背景任务以及子Agent的结果注入到messages中，大模型会根据这些结果继续推理
         # messages[:] = COMPACTOR.prepare(messages, active_request)
         system_prompt = build_system_prompt(
             workdir=WORKDIR,
@@ -470,6 +478,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             available_mcp_servers=MCP_MANAGER.available_servers(),
             connected_mcp_servers=MCP_MANAGER.connected_servers(),
             relevant_memories=relevant,
+            project_instructions=PROJECT_INSTRUCTIONS,
         )
         tools, handlers = MCP_MANAGER.assemble_tool_pool(
             builtin_tools=TOOLS,
@@ -533,7 +542,8 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             # 模型没有请求工具，不代表所有后台工作都结束。
             while True:
                 injected = inject_async_results(
-                    messages
+                    messages,
+                    subagent_tool_counts,
                 )
 
                 if injected:
@@ -547,7 +557,8 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
                     # “上次收集之后、状态检查之前”完成。
                     # 所以确认没有运行后，再收集一次。
                     injected = inject_async_results(
-                        messages
+                        messages,
+                        subagent_tool_counts,
                     )
                     break
 
@@ -570,6 +581,15 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             if still_running:
                 print(f"[background] still running: {still_running}")
             """
+
+            subagent_total = sum(subagent_tool_counts.values())
+
+            print(
+                f"[tools] 主 Agent: {tool_call_count}；"
+                f"子 Agent: {subagent_total}；"
+                f"合计: {tool_call_count + subagent_total}"
+            )
+            
             if MEMORY_MANAGER.extract_memories(messages):
                 MEMORY_MANAGER.consolidate_memories()
             return
@@ -588,8 +608,27 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
                 used_task = True
             #trigger_hooks("PreToolUse", tool_call)
             #tool_result = TOOL_HANDLERS[tool_call.name](**tool_call.input)
+
             tool_call_count += 1
             tool_result = TOOL_DISPATCHER.execute_tool(tool_call, handlers)
+            
+            if tool_call.name == "task":
+                try:
+                    receipt = json.loads(tool_result)
+                except (ValueError, TypeError):
+                    receipt = {}
+
+                if isinstance(receipt, dict):
+                    run_id = receipt.get("run_id")
+
+                    if (
+                        receipt.get("status") == "started"
+                        and isinstance(run_id, str)
+                        and run_id
+                    ):
+                        subagent_tool_counts.setdefault(run_id, 0)
+
+            
             suffix = "... [terminal preview truncated]" if len(tool_result) > 500 else ""
             print(f"Tool result: {tool_result[:500]}{suffix}")
             results.append({

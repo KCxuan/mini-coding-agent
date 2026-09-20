@@ -20,7 +20,7 @@ from tests.helpers import (
     IsolatedTestCase, ScriptedClient, load_main_functions,
     text_response, tool_call, tool_response,
 )
-
+import json
 
 class BackgroundTests(IsolatedTestCase):
     def shell(self):
@@ -171,6 +171,8 @@ class MainLoopTests(IsolatedTestCase):
             "TOOL_DISPATCHER": ToolDispatcher(hooks, background),
             "build_system_prompt": lambda **kwargs: "offline prompt",
             "time": SimpleNamespace(sleep=bounded_sleep), "test_sleeps": sleeps,
+            "PROJECT_INSTRUCTIONS": "",
+            "json": json,
         }
         return load_main_functions(
             namespace, "agent_loop", "inject_async_results", "request_usable_response",
@@ -192,7 +194,7 @@ class MainLoopTests(IsolatedTestCase):
     def delivery(self, sequence):
         steps = deque(sequence)
 
-        def inject(messages):
+        def inject(messages, *, tool_counts=None):
             if not steps:
                 raise AssertionError("Unexpected additional result collection")
             count = steps.popleft()
@@ -392,3 +394,56 @@ class MainLoopTests(IsolatedTestCase):
             ns["agent_loop"]([{"role": "user", "content": "Read"}], "Read")
         self.assertEqual(client.calls, [])
         ns["MEMORY_MANAGER"].extract_memories.assert_not_called()
+    
+    def test_subagent_counts_are_deduplicated_and_scoped(self):
+        from CodingAgent.subagent.state import SubagentState
+        from CodingAgent.subagent.results import format_subagent_result
+        from CodingAgent.tools.adapters import SubagentTools
+
+        states = []
+
+        for status, count in (
+            ("completed", 4),
+            ("failed", 2),
+            ("cancelled", 3),
+        ):
+            state = SubagentState(
+                task_id="task_check",
+                prompt="Check",
+                workdir=self.workdir,
+            )
+            state.status = status
+            state.tool_call_count = count
+            states.append(state)
+
+            result = json.loads(format_subagent_result(state))
+            self.assertEqual(result["tool_call_count"], count)
+
+        manager = Mock()
+        manager.collect.return_value = states
+        tools = SubagentTools(manager)
+
+        counts = {
+            state.run_id: 0
+            for state in states
+        }
+
+        # 模拟重复投递，同一运行不能累计两次。
+        tools.inject_subagent_results([], tool_counts=counts)
+        tools.inject_subagent_results([], tool_counts=counts)
+
+        self.assertEqual(sum(counts.values()), 9)
+
+        # 未登记的运行，不计入本轮。
+        unrelated = SubagentState(
+            task_id="task_other",
+            prompt="Other",
+            workdir=self.workdir,
+        )
+        unrelated.tool_call_count = 100
+        manager.collect.return_value = [unrelated]
+
+        tools.inject_subagent_results([], tool_counts=counts)
+
+        self.assertNotIn(unrelated.run_id, counts)
+        self.assertEqual(sum(counts.values()), 9)

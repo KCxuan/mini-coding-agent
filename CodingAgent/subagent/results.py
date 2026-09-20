@@ -183,6 +183,7 @@ def format_subagent_result(
             "error": state.error,
             "warnings": state.warnings,
             "turns_used": state.turns_used,
+            "tool_call_count": state.tool_call_count,
             "response_log": state.response_log,
             "evidence": evidence,
         },

@@ -42,5 +42,5 @@ class DefaultHooks:
 
     # Stop: 退出总结实际调用工具的次数
     def summary_hook(self, messages: list[dict], tool_call_count: int) -> str | None:
-        print(f"[HOOK] Total tool calls: {tool_call_count}")
+        print(f"[HOOK] 本Agent工具调用次数: {tool_call_count}")
         return None

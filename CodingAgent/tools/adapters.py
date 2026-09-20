@@ -49,11 +49,19 @@ class SubagentTools:
     def inject_subagent_results(
         self,
         messages: list[dict],
+        *,
+        tool_counts: dict[str, int] | None = None,
     ) -> int:
         completed = self.manager.collect()
 
         if not completed:
             return 0
+
+        if tool_counts is not None:
+            for state in completed:
+                # 只统计本轮主Agent登记过的运行
+                if state.run_id in tool_counts:
+                    tool_counts[state.run_id] = state.tool_call_count
 
         blocks = [
             {

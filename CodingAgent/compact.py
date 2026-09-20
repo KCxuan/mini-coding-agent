@@ -14,10 +14,10 @@ from .context_budget import (
 )
 
 class ContextCompactor:
-    CONTEXT_CHAR_LIMIT = 200000 # 上下文字符限制
+    # CONTEXT_CHAR_LIMIT = 200000 # 上下文字符限制
     TOOL_RESULT_BATCH_CHAR_LIMIT = 200000 # 工具结果批量字符限制
     LARGE_RESULT_CHAR_LIMIT = 30000 # 大型结果字符限制
-    SUMMARY_INPUT_CHAR_LIMIT = 80000 # 总结输入字符限制
+    # SUMMARY_INPUT_CHAR_LIMIT = 80000 # 总结输入字符限制
     KEEP_RECENT_RESULTS = 3 # 保留最近结果数量
     KEEP_RECENT_MESSAGES = 5 # 保留最近消息数量
 

@@ -1,13 +1,16 @@
 from pathlib import Path
 
-def build_subagent_prompt(workdir: Path, skill_catalog: str) -> str:
+def build_subagent_prompt(workdir: Path, skill_catalog: str, *, project_instructions: str = "") -> str:
     """构建subagent提示词"""
-    return (
+    prompt = (
         f"You are a read-only subagent at {workdir}. "
         "Finish only the code-reading, investigation, or review work "
         "in the given prompt. "
-        "You may use only read_file, glob, and load_skill. "
-        "glob matches file paths; it does not search file contents. "
+        "You may use only read_file, glob, grep, and load_skill. "
+        "glob matches file paths. "
+        "grep searches file contents for literal text and returns locations. "
+        "Use grep to locate relevant code, then read_file for surrounding context. "
+        "If grep reports truncated or incomplete results, narrow the search. "
         "read_file returns numbered pages. Use the returned next offset to "
         "continue reading; do not repeatedly increase limit from the beginning. "
         "Use relative glob patterns without parent-directory traversal. "
@@ -46,6 +49,16 @@ def build_subagent_prompt(workdir: Path, skill_catalog: str) -> str:
         "an empty string."
     )
 
+    if project_instructions.strip():
+        prompt += (
+            "\n\nProject instructions from AGENT.md:\n"
+            "Apply these conventions within your tool permissions. "
+            "Explicit user requests take precedence over project conventions.\n\n"
+            + project_instructions
+        )
+
+    return prompt
+
 def build_system_prompt(
     *,
     workdir: Path,
@@ -55,12 +68,15 @@ def build_system_prompt(
     available_mcp_servers: list[str],
     connected_mcp_servers: list[str],
     relevant_memories: str = "",
+    project_instructions: str = "",
 ) -> str:
     # index = read_memory_index()
     sections = [
         (
             f"You are a coding agent at {workdir}. "
             "Use tools to solve tasks. Act, don't explain. "
+            "Use glob to find file paths, grep to locate text in files, "
+            "and read_file to inspect the relevant code in context. "
             "Before starting any multi-step request, split the work with create_task "
             "and keep the returned IDs. Add ordering with update_task when a task "
             "must wait on others. "
@@ -76,8 +92,8 @@ def build_system_prompt(
             "Do not repeatedly launch the same work while waiting. "
             "If no useful work remains before results arrive, stop requesting "
             "tools; the host will wait and call you again when a result arrives. "
-            "Subagents are read-only and can only read files, match paths, "
-            "and load skill instructions. "
+            "Subagents are read-only and can read files, match paths, "
+            "search file contents, and load skill instructions. "
             "Delegate code reading, investigation, and review to them. "
             "Perform required edits, commands, and tests yourself. "
             "Avoid editing files that active subagents are reading. "
@@ -137,6 +153,13 @@ def build_system_prompt(
             "- Answer concisely, link sources for key facts, distinguish facts from inference, and clearly state what could not be verified.\n"
         ),
     ]
+    if project_instructions.strip():
+        sections.append(
+            "Project instructions from AGENT.md:\n"
+            "Apply these conventions within your tool permissions. "
+            "Explicit user requests take precedence over project conventions.\n\n"
+            + project_instructions
+        )
     if memory_index:
         sections.append(f"Memory catalog:\n{memory_index}")
 

@@ -3,7 +3,7 @@
 import json
 from unittest.mock import Mock, patch
 
-from CodingAgent.hooks import HookRegistry
+from CodingAgent.hooks import HookRegistry, DefaultHooks
 from CodingAgent.skill_loader import SkillLoader
 from CodingAgent.subagent.executor import SubagentExecutor
 from CodingAgent.subagent.results import format_subagent_result, subagent_evidence
@@ -171,3 +171,49 @@ class SubagentExecutorTests(IsolatedTestCase):
         self.assertTrue(result["remaining"])
         self.assertEqual(result["task_id"], state.task_id)
         self.assertEqual(result["run_id"], state.run_id)
+
+    def test_real_stop_hook_receives_subagent_tool_count(self):
+        # 覆盖：不调用工具、调用一次、同一轮调用两次。
+        for expected_count in (0, 1, 2):
+            with self.subTest(tool_count=expected_count):
+                responses = []
+
+                if expected_count:
+                    responses.append(
+                        tool_response(
+                            *(
+                                tool_call(call_id=f"call_{index}")
+                                for index in range(expected_count)
+                            )
+                        )
+                    )
+
+                responses.append(text_response())
+                client = ScriptedClient(*responses)
+
+                executor = self.executor(client)
+
+                # wraps 会真正执行默认回调，同时记录传入参数。
+                stop_hook = Mock(
+                    wraps=DefaultHooks(self.workdir).summary_hook
+                )
+                executor.hooks.register("Stop", stop_hook)
+
+                state = executor.execute_subagent(self.state())
+
+                self.assertEqual(state.status, "completed")
+                self.assertIsNone(state.error)
+                self.assertEqual(
+                    state.tool_call_count,
+                    expected_count,
+                )
+                stop_hook.assert_called_once_with(
+                    state.messages,
+                    expected_count,
+                )
+
+                # 正常完成，不应额外进入失败后的总结请求。
+                self.assertEqual(
+                    len(client.calls),
+                    2 if expected_count else 1,
+                )

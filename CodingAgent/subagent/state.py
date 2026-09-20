@@ -21,6 +21,10 @@ class SubagentState:
     # 执行过程
     status: str = "running"
     turns_used: int = 0
+    
+    # 当前子 Agent 本次运行处理的工具调用次数。
+    tool_call_count: int = 0
+
     messages: list[dict] = field(default_factory=list)
     response_log: list[dict] = field(default_factory=list)
     # 每次运行有自己的取消信号，取消 A 不会影响 B。
