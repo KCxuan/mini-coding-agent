@@ -46,7 +46,7 @@ class MCPManager:
 
         self.clients[name] = server
         names = ", ".join(tool["name"] for tool in tools) or "(none)"
-        print(f"  [mcp] connected: {name} -> {names}")
+        print(f"\033[34m  [mcp] connected: {name} -> {names}\033[0m")
         return (
             f"Connected to MCP server {name!r}. "
             f"Discovered {len(tools)} tools: {names}"
@@ -63,7 +63,7 @@ class MCPManager:
             try:
                 server.disconnect()
             except Exception as e:
-                print(f"  [mcp] error: {server_name!r} -> {e}")
+                print(f"\033[31m  [mcp] error: {server_name!r} -> {e}\033[0m")
             self.clients.pop(server_name, None)
         
         self.tool_policies.clear()

@@ -214,7 +214,7 @@ class ContextCompactor:
                     )
 
         except (OSError, UnicodeError) as error:
-            print(f"[compact skipped] 工具结果保存或读取失败：{error}")
+            print(f"\033[33m[compact skipped] 工具结果保存或读取失败：{error}\033[0m")
             return output
 
         return (
@@ -377,11 +377,11 @@ class ContextCompactor:
         old_history, recent_history = self.split_recent_history(messages)
 
         if not old_history:
-            print("[compact skipped] 没有可总结的旧历史")
+            print("\033[33m[compact skipped] 没有可总结的旧历史\033[0m")
             return messages
 
         transcript = self.write_transcript(messages)
-        print(f"[transcript saved: {transcript}]")
+        print(f"\033[33m[transcript saved: {transcript}]\033[0m")
 
         # 失败时直接抛出异常，不生成替换历史。
         summary = self.summarize_history(old_history)
@@ -454,7 +454,7 @@ class ContextCompactor:
             return candidate
 
         # 仍然超过预算，再总结旧历史。
-        print("[auto compact]")
+        print("\033[33m[auto compact]\033[0m")
         candidate = self.compact_history(
             candidate,
             active_request,

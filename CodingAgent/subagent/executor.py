@@ -214,8 +214,8 @@ class SubagentExecutor:
                     })
 
                     print(
-                        f"[{state.run_id}] "
-                        f"{tool_call.name}: {output[:100]}"
+                        f"\033[32m[{state.run_id}] "
+                        f"{tool_call.name}: {output[:100]}\033[0m"
                     )
 
                     # 先记录工具结果，再处理时间耗尽。

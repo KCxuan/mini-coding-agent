@@ -294,7 +294,7 @@ class MemoryManager:
                 stored += 1
 
             if stored:
-                print(f"\n\033[33m[Memory: stored {stored} records]\033[0m")
+                print(f"\n\033[35m[Memory: stored {stored} records]\033[0m")
             return stored
         except Exception as error:
             print(f"\n\033[33m[Memory extraction skipped: {error}]\033[0m")
@@ -349,7 +349,7 @@ class MemoryManager:
             self.store.replace_records(records, consolidated)
 
             print(
-                f"\n\033[33m[Memory: consolidated {len(records)} "
+                f"\n\033[35m[Memory: consolidated {len(records)} "
                 f"to {len(consolidated)} records]\033[0m"
             )
             return len(consolidated)

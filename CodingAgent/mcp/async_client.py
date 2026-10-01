@@ -176,7 +176,7 @@ class AsyncMCPClient(MCPClient):
                 pass
 
             if self._error:
-                print(f"  [mcp] {self._error}")
+                print(f"\033[31m  [mcp] {self._error}\033[0m")
 
         finally:
             self._owner = None

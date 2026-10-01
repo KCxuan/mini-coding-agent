@@ -96,8 +96,8 @@ class AsyncPermissionManager(PermissionManager):
         if threading.current_thread() is not threading.main_thread():
             return "deny"
 
-        print(f"\n⚠  {reason}")
-        print(f"   Tool: {tool_name}({args})")
+        print(f"\n\033[33m⚠  {reason}\033[0m")
+        print(f"\033[33m   Tool: {tool_name}({args})\033[0m")
 
         try:
             choice = await self.console.read("   Allow? [y/N] ")
@@ -116,7 +116,7 @@ class AsyncPermissionManager(PermissionManager):
                 block.input.get("command", "")
             )
             if reason:
-                print(f"\n⛔ {reason}")
+                print(f"\n\033[31m⛔ {reason}\033[0m")
                 return reason
 
         if block.name in {

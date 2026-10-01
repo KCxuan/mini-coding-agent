@@ -152,7 +152,7 @@ BACKGROUND = BackgroundManager(SHELL)
 try:
     MCP_CONFIG = load_mcp_config(MCP_CONFIG_PATH)
 except (FileNotFoundError, ValueError) as e:
-    print(f"Error loading MCP config: {e}")
+    print(f"\033[31mError loading MCP config: {e}\033[0m")
     MCP_CONFIG = {}
 
 MCP_HOST_POLICY = {
@@ -327,6 +327,9 @@ async def async_request_usable_response(
     # MAX_RESPONSE_RETRIES = 1 时：
     # attempt 分别是 0、1，总共最多请求两次。
     for attempt in range(MAX_RESPONSE_RETRIES + 1):
+        printed_text = False
+
+        """
         response = await llm.messages.create(
             model=MODEL,
             system=system_prompt,
@@ -334,6 +337,23 @@ async def async_request_usable_response(
             tools=tools,
             max_tokens=max_tokens,
         )
+        """
+        try:
+            async with llm.messages.stream(
+                model=MODEL,
+                system=system_prompt,
+                messages=messages,
+                tools=tools,
+                max_tokens=max_tokens,
+            ) as stream:
+                async for text in stream.text_stream:
+                    print(text, end="", flush=True)
+                    printed_text = True
+
+                response = await stream.get_final_message()
+        finally:
+            if printed_text:
+                print()
 
         stop_reason = getattr(response, "stop_reason", None)
         blocks = response.content or []
@@ -390,8 +410,8 @@ async def async_request_usable_response(
             )
 
         print(
-            f"[response retry] {problem}；"
-            f"准备重试，输出上限为 {max_tokens}"
+            f"\033[33m[response retry] {problem}；"
+            f"准备重试，输出上限为 {max_tokens}\033[0m"
         )
 
 # --------------------------------------------------------
@@ -425,9 +445,9 @@ async def confirm_more_rounds(rounds_used: int, console: AsyncConsole) -> bool:
         if answer in ("", "n", "no"):
             return False
 
-        print("请输入 y 继续，或输入 n / 直接回车停止。")
+        print("\033[33m请输入 y 继续，或输入 n / 直接回车停止。\033[0m")
 
-async def async_agent_loop(messages: list[dict], active_request: str, *, llm, console, dispatcher) -> str:
+async def async_agent_loop(messages: list[dict], active_request: str, *, llm, console, dispatcher: AsyncToolDispatcher) -> str:
     """
     Agent loop for the coding agent.
     messages: 消息列表
@@ -462,8 +482,8 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
                 )
             rounds_allowed += AGENT_ROUND_BATCH
             print(
-                f"[继续] 总额度已增加到 {rounds_allowed} 轮，"
-                f"即将开始第 {rounds_used + 1} 轮。"
+                f"\033[34m[继续] 总额度已增加到 {rounds_allowed} 轮，"
+                f"即将开始第 {rounds_used + 1} 轮。\033[0m"
             )
         rounds_used += 1
 
@@ -506,9 +526,9 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
         )
 
         print(
-            f"[context] 输入约 {estimated:,} token；"
+            f"\033[90m[context] 输入约 {estimated:,} token；"
             f"含输出预留约占 "
-            f"{(estimated + output_reserve) / CONFIG.context_window_tokens:.1%}"
+            f"{(estimated + output_reserve) / CONFIG.context_window_tokens:.1%}\033[0m"
         )
 
         try:
@@ -521,14 +541,14 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
 
             usage = getattr(response, "usage", None)
             if usage is not None:
-                print(f"[usage 原始统计] {usage}")
+                print(f"\033[90m[usage 原始统计] {usage}\033[0m")
 
             reactive_retries = 0
         except Exception as error:
             too_long = any(text in str(error).lower()
                            for text in ("prompt_too_long", "too many tokens"))
             if too_long and reactive_retries < MAX_REACTIVE_RETRIES:
-                print("[reactive compact]")
+                print("\033[33m[reactive compact]\033[0m")
                 messages[:] = await run_sync(
                     COMPACTOR.reactive_compact,
                     messages,
@@ -590,9 +610,9 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
             subagent_total = sum(subagent_tool_counts.values())
 
             print(
-                f"[tools] 主 Agent: {tool_call_count}；"
+                f"\033[90m[tools] 主 Agent: {tool_call_count}；"
                 f"子 Agent: {subagent_total}；"
-                f"合计: {tool_call_count + subagent_total}"
+                f"合计: {tool_call_count + subagent_total}\033[0m"
             )
             
             if await run_sync(MEMORY_MANAGER.extract_memories, messages):
@@ -604,7 +624,7 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
         used_task = False
         compact_requested = False
         for tool_call in tool_calls:
-            print(f"Tool call: {tool_call.name}")
+            print(f"\033[36mTool call: {tool_call.name}\033[0m")
             #if tool_call.name == "todo_write":
             #    used_todo = True
             if tool_call.name == "compact":
@@ -635,7 +655,7 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
 
             
             suffix = "... [terminal preview truncated]" if len(tool_result) > 500 else ""
-            print(f"Tool result: {tool_result[:500]}{suffix}")
+            print(f"\033[32mTool result: {tool_result[:500]}{suffix}\033[0m")
             results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
@@ -676,7 +696,7 @@ async def cleanup_program_async() -> None:
         return
 
     _cleanup_started = True
-    print("\n[shutdown] 正在停止后台运行并清理资源……")
+    print("\n\033[90m[shutdown] 正在停止后台运行并清理资源……\033[0m")
 
     unfinished = []
 
@@ -688,8 +708,8 @@ async def cleanup_program_async() -> None:
         )
     except Exception as exc:
         print(
-            "[shutdown] 子 Agent 清理出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] 子 Agent 清理出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
     # 2. 清理主 Agent 启动的 Shell 子进程。
@@ -697,8 +717,8 @@ async def cleanup_program_async() -> None:
         await run_sync(SHELL.stop_all_shell_processes)
     except Exception as exc:
         print(
-            "[shutdown] Shell 清理出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] Shell 清理出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
     # 3. 断开 MCP。
@@ -706,8 +726,8 @@ async def cleanup_program_async() -> None:
         await MCP_MANAGER.disconnect_all_mcp()
     except Exception as exc:
         print(
-            "[shutdown] MCP 清理出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] MCP 清理出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
     # 4. 展示尚未被收集的结果。
@@ -717,24 +737,24 @@ async def cleanup_program_async() -> None:
 
         for state in completed:
             print(
-                f"\n[shutdown] 子 Agent 结果：{state.run_id}"
+                f"\n\033[32m[shutdown] 子 Agent 结果：{state.run_id}\033[0m"
             )
-            print(format_subagent_result(state))
+            print(f"\033[32m{format_subagent_result(state)}\033[0m")
 
         for run_id in unfinished:
             snapshot = SUBAGENTS.get(run_id)
 
             if snapshot["status"] in ("running", "cancelling"):
                 print(
-                    f"[shutdown] {run_id}："
+                    f"\033[33m[shutdown] {run_id}："
                     "等待期限已到，当前仍未完成交接；"
-                    "不会将其标记为取消完成。"
+                    "不会将其标记为取消完成。\033[0m"
                 )
 
     except Exception as exc:
         print(
-            "[shutdown] 结果展示出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] 结果展示出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
     finally:
          # 仍有 Subagent 使用这个客户端时，不提前关闭它。
@@ -742,9 +762,9 @@ async def cleanup_program_async() -> None:
             try:
                 await run_sync(client.close)
             except Exception as exc:
-                print(f"[shutdown] 同步模型客户端关闭失败：{exc}")
+                print(f"\033[31m[shutdown] 同步模型客户端关闭失败：{exc}\033[0m")
 
-    print("[shutdown] 退出清理流程结束。")
+    print("\033[90m[shutdown] 退出清理流程结束。\033[0m")
 
 
 async def async_main():
@@ -805,15 +825,15 @@ async def async_main():
         ) as llm:
             try:
                 print(
-                    f"Starting async {MODEL} agent "
-                    f"at {os.getcwd()}"
+                    f"\033[90mStarting async {MODEL} agent "
+                    f"at {os.getcwd()}\033[0m"
                 )
-                print("Type 'exit' to end the conversation.")
+                print("\033[90mType 'exit' to end the conversation.\033[0m")
 
                 history = []
 
                 # 避免后台 print 破坏正在编辑的输入提示。
-                with patch_stdout():
+                with patch_stdout(raw=True):
                     while True:
                         try:
                             query = await console.read("s01 >> ")
@@ -840,12 +860,13 @@ async def async_main():
                         )
 
                         response_content = history[-1]["content"]
-
+                        """
                         if isinstance(response_content, list):
                             for block in response_content:
                                 if getattr(block, "type", None) == "text":
                                     print(block.text)
 
+                        """
                         print()
 
             except KeyboardInterrupt:
@@ -873,8 +894,8 @@ if __name__ == "__main__":
         AgentRoundLimitError,
         ContextBudgetError,
     ) as error:
-        print(f"\n[未完成] {error}")
-        print("程序已执行退出清理；此前的文件修改不会自动撤销。")
+        print(f"\n\033[31m[未完成] {error}\033[0m")
+        print("\033[33m程序已执行退出清理；此前的文件修改不会自动撤销。\033[0m")
         raise SystemExit(1)
 
     except (KeyboardInterrupt, asyncio.CancelledError):

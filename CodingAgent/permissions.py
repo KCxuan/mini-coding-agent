@@ -36,13 +36,13 @@ def ask_user(
         is not threading.main_thread()
     ):
         print(
-            f"[permission] 后台工具 {tool_name} "
-            f"需要确认，已拒绝：{reason}"
+            f"\033[31m[permission] 后台工具 {tool_name} "
+            f"需要确认，已拒绝：{reason}\033[0m"
         )
         return "deny"
 
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
+    print(f"\n\033[33m⚠  {reason}\033[0m")
+    print(f"\033[33m   Tool: {tool_name}({args})\033[0m")
 
     choice = input(
         "   Allow? [y/N] "
@@ -101,7 +101,7 @@ class PermissionManager:
             """
             reason = check_deny_list(block.input.get("command", ""))
             if reason:
-                print(f"\n⛔ {reason}")
+                print(f"\n\033[31m⛔ {reason}\033[0m")
                 return reason
         
         if block.name == "bash" or block.name in ["read_file", "write_file", "edit_file"]:

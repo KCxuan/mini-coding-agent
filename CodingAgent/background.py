@@ -39,7 +39,7 @@ class BackgroundManager:
             with self._lock:
                 self.tasks.pop(task_id, None)
             raise
-        print(f"  [background] started {task_id}: {command[:60]}")
+        print(f"\033[34m  [background] started {task_id}: {command[:60]}\033[0m")
         return task_id
 
     def _run(self, task_id, command):
@@ -121,7 +121,7 @@ class BackgroundManager:
             self._ready.clear()
 
         for task_id in ready_ids:
-            print(f"  [background] collected {task_id}")
+            print(f"\033[34m  [background] collected {task_id}\033[0m")
 
         return notifications
 

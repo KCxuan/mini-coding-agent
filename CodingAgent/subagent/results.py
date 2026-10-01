@@ -98,7 +98,7 @@ def record_subagent_response(state, response, *, phase: str, max_tokens: int) ->
         "output_tokens": getattr(usage, "output_tokens", None),
     }
     state.response_log.append(record)
-    print(f"[{state.run_id}] response: {json.dumps(record, ensure_ascii=False)}")
+    print(f"\033[90m[{state.run_id}] response: {json.dumps(record, ensure_ascii=False)}\033[0m")
 
 
 def apply_subagent_summary(

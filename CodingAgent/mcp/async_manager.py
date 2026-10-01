@@ -56,7 +56,7 @@ class AsyncMCPManager(MCPManager):
                 tool["name"] for tool in tools
             ) or "(none)"
 
-            print(f"  [mcp] connected: {name} -> {names}")
+            print(f"\033[34m  [mcp] connected: {name} -> {names}\033[0m")
 
             return (
                 f"Connected to MCP server {name!r}. "
@@ -74,7 +74,7 @@ class AsyncMCPManager(MCPManager):
             try:
                 await server.disconnect()
             except Exception as exc:
-                print(f"  [mcp] error: {name!r} -> {exc}")
+                print(f"\033[31m  [mcp] error: {name!r} -> {exc}\033[0m")
             finally:
                 self.clients.pop(name, None)
 

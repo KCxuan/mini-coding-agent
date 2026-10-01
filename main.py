@@ -150,7 +150,7 @@ BACKGROUND = BackgroundManager(SHELL)
 try:
     MCP_CONFIG = load_mcp_config(MCP_CONFIG_PATH)
 except (FileNotFoundError, ValueError) as e:
-    print(f"Error loading MCP config: {e}")
+    print(f"\033[31mError loading MCP config: {e}\033[0m")
     MCP_CONFIG = {}
 
 MCP_HOST_POLICY = {
@@ -397,8 +397,8 @@ def request_usable_response(
             )
 
         print(
-            f"[response retry] {problem}；"
-            f"准备重试，输出上限为 {max_tokens}"
+            f"\033[33m[response retry] {problem}；"
+            f"准备重试，输出上限为 {max_tokens}\033[0m"
         )
 
 # --------------------------------------------------------
@@ -431,7 +431,7 @@ def confirm_more_rounds(rounds_used: int) -> bool:
         if answer in ("", "n", "no"):
             return False
 
-        print("请输入 y 继续，或输入 n / 直接回车停止。")
+        print("\033[33m请输入 y 继续，或输入 n / 直接回车停止。\033[0m")
 
 def agent_loop(messages: list[dict],active_request: str) -> str:
     """
@@ -465,8 +465,8 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
                 )
             rounds_allowed += AGENT_ROUND_BATCH
             print(
-                f"[继续] 总额度已增加到 {rounds_allowed} 轮，"
-                f"即将开始第 {rounds_used + 1} 轮。"
+                f"\033[34m[继续] 总额度已增加到 {rounds_allowed} 轮，"
+                f"即将开始第 {rounds_used + 1} 轮。\033[0m"
             )
         rounds_used += 1
 
@@ -508,9 +508,9 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
         )
 
         print(
-            f"[context] 输入约 {estimated:,} token；"
+            f"\033[90m[context] 输入约 {estimated:,} token；"
             f"含输出预留约占 "
-            f"{(estimated + output_reserve) / CONFIG.context_window_tokens:.1%}"
+            f"{(estimated + output_reserve) / CONFIG.context_window_tokens:.1%}\033[0m"
         )
 
         try:
@@ -522,14 +522,14 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
 
             usage = getattr(response, "usage", None)
             if usage is not None:
-                print(f"[usage 原始统计] {usage}")
+                print(f"\033[90m[usage 原始统计] {usage}\033[0m")
 
             reactive_retries = 0
         except Exception as error:
             too_long = any(text in str(error).lower()
                            for text in ("prompt_too_long", "too many tokens"))
             if too_long and reactive_retries < MAX_REACTIVE_RETRIES:
-                print("[reactive compact]")
+                print("\033[33m[reactive compact]\033[0m")
                 messages[:] = COMPACTOR.reactive_compact(messages, active_request)
                 reactive_retries += 1
                 continue
@@ -587,9 +587,9 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
             subagent_total = sum(subagent_tool_counts.values())
 
             print(
-                f"[tools] 主 Agent: {tool_call_count}；"
+                f"\033[90m[tools] 主 Agent: {tool_call_count}；"
                 f"子 Agent: {subagent_total}；"
-                f"合计: {tool_call_count + subagent_total}"
+                f"合计: {tool_call_count + subagent_total}\033[0m"
             )
             
             if MEMORY_MANAGER.extract_memories(messages):
@@ -601,7 +601,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
         used_task = False
         compact_requested = False
         for tool_call in tool_calls:
-            print(f"Tool call: {tool_call.name}")
+            print(f"\033[36mTool call: {tool_call.name}\033[0m")
             #if tool_call.name == "todo_write":
             #    used_todo = True
             if tool_call.name == "compact":
@@ -632,7 +632,7 @@ def agent_loop(messages: list[dict],active_request: str) -> str:
 
             
             suffix = "... [terminal preview truncated]" if len(tool_result) > 500 else ""
-            print(f"Tool result: {tool_result[:500]}{suffix}")
+            print(f"\033[32mTool result: {tool_result[:500]}{suffix}\033[0m")
             results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,
@@ -671,7 +671,7 @@ def cleanup_program() -> None:
         return
 
     _cleanup_started = True
-    print("\n[shutdown] 正在停止后台运行并清理资源……")
+    print("\n\033[90m[shutdown] 正在停止后台运行并清理资源……\033[0m")
 
     unfinished = []
 
@@ -682,8 +682,8 @@ def cleanup_program() -> None:
         )
     except Exception as exc:
         print(
-            "[shutdown] 子 Agent 清理出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] 子 Agent 清理出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
     # 2. 清理主 Agent 启动的 Shell 子进程。
@@ -691,8 +691,8 @@ def cleanup_program() -> None:
         SHELL.stop_all_shell_processes()
     except Exception as exc:
         print(
-            "[shutdown] Shell 清理出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] Shell 清理出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
     # 3. 断开 MCP。
@@ -700,8 +700,8 @@ def cleanup_program() -> None:
         MCP_MANAGER.disconnect_all_mcp()
     except Exception as exc:
         print(
-            "[shutdown] MCP 清理出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] MCP 清理出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
     # 4. 展示尚未被收集的结果。
@@ -711,27 +711,27 @@ def cleanup_program() -> None:
 
         for state in completed:
             print(
-                f"\n[shutdown] 子 Agent 结果：{state.run_id}"
+                f"\n\033[32m[shutdown] 子 Agent 结果：{state.run_id}\033[0m"
             )
-            print(format_subagent_result(state))
+            print(f"\033[32m{format_subagent_result(state)}\033[0m")
 
         for run_id in unfinished:
             snapshot = SUBAGENTS.get(run_id)
 
             if snapshot["status"] in ("running", "cancelling"):
                 print(
-                    f"[shutdown] {run_id}："
+                    f"\033[33m[shutdown] {run_id}："
                     "等待期限已到，当前仍未完成交接；"
-                    "不会将其标记为取消完成。"
+                    "不会将其标记为取消完成。\033[0m"
                 )
 
     except Exception as exc:
         print(
-            "[shutdown] 结果展示出错："
-            f"{type(exc).__name__}: {exc}"
+            "\033[31m[shutdown] 结果展示出错："
+            f"{type(exc).__name__}: {exc}\033[0m"
         )
 
-    print("[shutdown] 退出清理流程结束。")
+    print("\033[90m[shutdown] 退出清理流程结束。\033[0m")
 
 
 # 原来的两项注册在前面已经执行。
@@ -741,8 +741,8 @@ atexit.register(cleanup_program)
 
 if __name__ == "__main__":
     try:
-        print(f"Starting {MODEL} agent at {os.getcwd()}")
-        print("Type 'exit' to end the conversation.")
+        print(f"\033[90mStarting {MODEL} agent at {os.getcwd()}\033[0m")
+        print("\033[90mType 'exit' to end the conversation.\033[0m")
         history = []
         while True:
             try:
@@ -763,10 +763,10 @@ if __name__ == "__main__":
                         print(block.text)
             print()
     except (IncompleteResponseError, AgentRoundLimitError, ContextBudgetError) as error:
-        print(f"\n[未完成] {error}")
+        print(f"\n\033[31m[未完成] {error}\033[0m")
         print(
-            "当前程序将退出并执行清理。"
-            "此前已经执行的文件修改不会自动撤销。"
+            "\033[33m当前程序将退出并执行清理。"
+            "此前已经执行的文件修改不会自动撤销。\033[0m"
         )
         raise SystemExit(1)
     except KeyboardInterrupt:

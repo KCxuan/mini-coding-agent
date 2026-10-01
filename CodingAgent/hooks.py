@@ -33,14 +33,14 @@ class DefaultHooks:
 
     # PreToolUse: 日志
     def log_hook(self, block):
-        print(f"[HOOK] {block.name}(...)")
+        print(f"\033[90m[HOOK] {block.name}(...)\033[0m")
 
     # PostToolUse: 大文件提醒
     def large_output_hook(self, block, output):
         if len(str(output)) > 100000:
-            print(f"[HOOK] ⚠ Large output from {block.name}")
+            print(f"\033[33m[HOOK] ⚠ Large output from {block.name}\033[0m")
 
     # Stop: 退出总结实际调用工具的次数
     def summary_hook(self, messages: list[dict], tool_call_count: int) -> str | None:
-        print(f"[HOOK] 本Agent工具调用次数: {tool_call_count}")
+        print(f"\033[90m[HOOK] 本Agent工具调用次数: {tool_call_count}\033[0m")
         return None

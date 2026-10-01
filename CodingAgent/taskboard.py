@@ -226,7 +226,7 @@ class TaskBoard:
         task.owner = owner
         task.status = "in_progress"
         self.store.save(task)
-        print(f"  [claim] {task.subject} -> in_progress (owner: {owner})")
+        print(f"\033[34m  [claim] {task.subject} -> in_progress (owner: {owner})\033[0m")
         return f"Claimed {task.id} ({task.subject})"
 
     def complete_task(self, task_id: str, owner: str = "agent") -> str:
@@ -251,11 +251,11 @@ class TaskBoard:
                     and candidate.blockedBy
                     and candidate.id not in ready_before
                     and self.can_start(candidate.id)]
-        print(f"  [complete] {task.subject}")
+        print(f"\033[32m  [complete] {task.subject}\033[0m")
         message = f"Completed {task.id} ({task.subject})"
         if unblocked:
             message += f"\nUnblocked: {', '.join(unblocked)}"
-            print(f"  [unblocked] {', '.join(unblocked)}")
+            print(f"\033[32m  [unblocked] {', '.join(unblocked)}\033[0m")
         return message
 
     def run_create_task(self, subject: str, description: str = "") -> str:
@@ -265,7 +265,7 @@ class TaskBoard:
         description: 任务描述
         """
         task = self.create_task(subject, description)
-        print(f"  [create task] {task.subject}")
+        print(f"\033[34m  [create task] {task.subject}\033[0m")
         return f"Created task {task.id}: ({task.subject})"
 
     def run_update_task(self, task_id: str, addBlockedBy: list[str]) -> str:
@@ -276,7 +276,7 @@ class TaskBoard:
         """
         task = self.update_task(task_id, addBlockedBy)
         dependencies = ",".join(task.blockedBy) or "(none)"
-        print(f"  [update task] {task.subject} -> {dependencies}")
+        print(f"\033[34m  [update task] {task.subject} -> {dependencies}\033[0m")
         return f"Updated task {task.id}: ({task.subject}) -> {dependencies}"
 
     def run_list_tasks(self) -> str:
