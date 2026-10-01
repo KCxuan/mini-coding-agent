@@ -20,7 +20,7 @@
 
 ## 架构设计
 
-`main.py` 负责创建并连接各模块、运行主 Agent 循环，以及退出时的资源清理。功能实现位于 `CodingAgent/`，通过构造参数传入所需依赖。
+`main.py` 提供同步入口，`main_async.py` 提供异步入口；每次运行选择其中一个。两者负责创建并连接各模块、运行主 Agent 循环，以及退出时的资源清理。功能实现位于 `CodingAgent/`，通过构造参数传入所需依赖。
 
 ```mermaid
 flowchart TD
@@ -47,14 +47,18 @@ flowchart TD
 
 **任务与运行的区别**：`task_id` 标识看板中的任务，`run_id` 标识一次子 Agent 运行。主 Agent 先创建并认领任务，再通过 `task` 工具启动子 Agent。启动回执立即返回，最终结果通过 `subagent_result` 交回主循环，由主 Agent 验证和整合。
 
-**后台执行方式**：主循环以同步方式运行；后台 Shell 和子 Agent 使用线程执行。MCP 通过 `AsyncBridge` 在独立线程中维护 asyncio 事件循环，供同步代码提交异步操作。
+**执行方式**：同步入口通过 `AsyncBridge` 在线程中维护 MCP 事件循环。异步入口使用 `AsyncAnthropic`，MCP 会话在主事件循环中连接、调用和关闭；用户输入和权限确认也使用异步接口。两种入口都沿用后台 Shell 和子 Agent 的线程管理器，单轮工具仍按顺序执行。
+
+**同步模块适配**：异步入口把记忆、压缩和可能阻塞的本地工具交给工作线程，并等待结果后继续主流程。取消时会等待这些同步工作实际结束，因此退出并非总能立即完成。共享压缩模块的摘要输出额度为 25,000 token，摘要请求显式设置 `timeout=1200`；此参数是网络超时配置，不是整个 Agent 的总运行时限。
 
 ### 代码结构
 
 ```text
 mini-coding-agent/
 ├── main.py                  # 入口、依赖组装、主循环、统一退出
+├── main_async.py            # 异步入口、异步输入、MCP 与退出清理
 ├── CodingAgent/
+│   ├── async_support.py     # 线程适配、异步输入、Hooks、权限与工具分发
 │   ├── config.py            # 配置与工作目录派生路径
 │   ├── context_budget.py    # 请求 token 粗估与压缩触发比例
 │   ├── project_instructions.py  # 读取工作目录 AGENT.md
@@ -147,6 +151,15 @@ ANTHROPIC_BASE_URL=https://your-provider.example
 ```sh
 python -B -u main.py
 ```
+
+使用异步入口时，先安装附加依赖：
+
+```sh
+python -m pip install -r requirements-async.txt
+python -B -u main_async.py
+```
+
+两个入口使用相同的模型环境变量、工作目录规则和 MCP 配置。异步测试及验证边界见 [tests/README_async.md](tests/README_async.md)。
 
 看到 `s01 >>` 后输入任务，例如：
 

@@ -81,18 +81,18 @@ class ScriptedClient:
         return response
 
 
-def load_main_functions(namespace, *names):
+def load_main_functions(namespace, *names, source="main.py"):
     """提取明确列出的函数、异常类和常量，避开顶层初始化。
 
     这是主循环逻辑的隔离测试，不是 CLI 启动测试。函数体来自磁盘，
     没有维护另一份 agent_loop；依赖由每个测试显式传入。
     """
-    path = Path(__file__).resolve().parents[1] / "main.py"
+    path = Path(__file__).resolve().parents[1] / source
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     nodes = []
     found = set()
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
             nodes.append(node)
             found.add(node.name)
         elif (isinstance(node, ast.Assign) and len(node.targets) == 1
@@ -105,7 +105,7 @@ def load_main_functions(namespace, *names):
             nodes.append(node)
             found.add(node.targets[0].id)
     if found != set(names):
-        raise AssertionError(f"main.py missing definitions: {set(names) - found}")
+        raise AssertionError(f"{source} missing definitions: {set(names) - found}")
     module = ast.Module(body=nodes, type_ignores=[])
     exec(compile(module, str(path), "exec"), namespace)
     return namespace

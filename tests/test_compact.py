@@ -123,6 +123,16 @@ class CompactTests(IsolatedTestCase):
         self.assertEqual(len(list(self.compactor.transcript_dir.glob("*.jsonl"))), 1)
         self.assertEqual(len(self.client.calls), 1)
 
+    def test_summary_request_uses_default_output_budget_and_timeout(self):
+        # 保留业务默认配置，检查真正传给模型客户端的参数。
+        summary = self.compactor.summarize_history(
+            [{"role": "user", "content": "Preserve the project constraints."}]
+        )
+        self.assertEqual(summary, "Goal and constraints preserved.")
+        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(self.client.calls[0]["max_tokens"], 25000)
+        self.assertEqual(self.client.calls[0]["timeout"], 1200)
+
     def test_reactive_compact_keeps_recent_tool_pairs(self):
         messages = [{"role": "user", "content": "Original goal"}]
         for number in range(8):
@@ -250,6 +260,8 @@ class CompactTests(IsolatedTestCase):
         messages = self.history()
         before = copy.deepcopy(messages)
         self.compactor.context_window_tokens = 14000
+        # 小窗口搭配小摘要额度，确保测试能走到模型压缩这一步。
+        self.compactor.SUMMARY_OUTPUT_TOKENS = 2000
         result = self.prepare(messages)
         self.assertEqual(len(self.client.calls), 1)
         self.assertLess(estimate_request_tokens("system", result, []) + 500, 12600)
@@ -262,6 +274,8 @@ class CompactTests(IsolatedTestCase):
         messages = self.history()
         before = copy.deepcopy(messages)
         self.compactor.context_window_tokens = 20000
+        # 让摘要请求本身装得下，再验证压缩后的完整请求仍超预算。
+        self.compactor.SUMMARY_OUTPUT_TOKENS = 2000
         with self.assertRaisesRegex(ContextBudgetError, "压缩后预计请求仍超过预算"):
             self.prepare(messages, system="!" * 20000)
         self.assertEqual(len(self.client.calls), 1)

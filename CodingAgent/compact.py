@@ -20,7 +20,7 @@ class ContextCompactor:
     KEEP_RECENT_RESULTS = 3 # 保留最近结果数量
     KEEP_RECENT_MESSAGES = 5 # 保留最近消息数量
 
-    SUMMARY_OUTPUT_TOKENS = 2000
+    SUMMARY_OUTPUT_TOKENS = 25000
 
     SUMMARY_SYSTEM_PROMPT = (
         "Summarize the supplied coding-agent history as factual state. "
@@ -338,6 +338,7 @@ class ContextCompactor:
                 }
             ],
             max_tokens=self.SUMMARY_OUTPUT_TOKENS,
+            timeout=1200,
         )
 
         if getattr(response, "stop_reason", None) != "end_turn":
