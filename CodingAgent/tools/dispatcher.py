@@ -1,5 +1,6 @@
 from ..background import BackgroundManager, should_run_background
 from ..hooks import HookRegistry
+from ..images import ToolContent, normalize_tool_result
 
 
 class ToolDispatcher:
@@ -17,7 +18,7 @@ class ToolDispatcher:
         handlers: dict,
         *,
         allow_background: bool = True,
-    ) -> str:
+    ) -> ToolContent:
         blocked = self.hooks.trigger("PreToolUse", tool_call)
         if blocked:
             return str(blocked)
@@ -47,4 +48,4 @@ class ToolDispatcher:
                 output = f"Error: {e}"
 
         self.hooks.trigger("PostToolUse", tool_call, output)
-        return str(output)
+        return normalize_tool_result(output)

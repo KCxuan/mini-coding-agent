@@ -3,6 +3,7 @@ import re
 from .bridge import AsyncBridge
 from .client import MCPClient
 from .config import MCPServerConfig
+from pathlib import Path
 
 _DISALLOWED_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -19,10 +20,12 @@ class MCPManager:
         bridge: AsyncBridge,
         *,
         host_policy: dict[tuple[str, str], str],
+        image_dir: Path | None = None,
     ):
         self.configs = configs
         self.bridge = bridge
         self.host_policy = host_policy
+        self.image_dir = image_dir
 
         self.clients: dict[str, MCPClient] = {}
         self.tool_policies: dict[str, str] = {}
@@ -38,7 +41,7 @@ class MCPManager:
             avaliable = ", ".join(self.configs) or "(none)"
             return f"MCP server {name!r} not found in config. Available: {avaliable}"
         
-        server = MCPClient(config, self.bridge)
+        server = MCPClient(config, self.bridge, image_dir=self.image_dir)
         try:
             tools = server.connect()
         except Exception as e:

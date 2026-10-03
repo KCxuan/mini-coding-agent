@@ -156,6 +156,25 @@ BASE_TOOLS = [
             "required": ["name"]
         }
     },
+    {
+        "name": "read_image",
+        "description": (
+            "Inspect a local PNG, JPEG, GIF or WebP image inside the "
+            "working directory. Returns the actual image to the model. "
+            "Use this to inspect saved screenshots again after compaction."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Image path relative to the working directory.",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 TASK_BOARD_TOOLS = [

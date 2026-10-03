@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from CodingAgent.async_support import (
 )
 from CodingAgent.context_budget import ContextBudgetError, estimate_request_tokens
 from CodingAgent.hooks import DefaultHooks, HookRegistry
+from CodingAgent.images import tool_result_preview
 from CodingAgent.subagent.manager import SubagentManager
 from CodingAgent.taskboard import TaskBoard, TaskStore
 from CodingAgent.tools.adapters import SubagentTools
@@ -57,6 +59,7 @@ class AsyncMainTests(AsyncIsolatedTestCase):
             "CONFIG": SimpleNamespace(context_window_tokens=1_000_000),
             "ContextBudgetError": ContextBudgetError,
             "estimate_request_tokens": estimate_request_tokens,
+            "tool_result_preview": tool_result_preview,
             "BACKGROUND": background, "SUBAGENTS": subagents,
             "SUBAGENT_TOOLS": subagent_tools, "MEMORY_MANAGER": memory,
             "MEMORY_STORE": Mock(), "SKILL_LOADER": Mock(), "COMPACTOR": compactor,
@@ -265,7 +268,8 @@ class AsyncMainTests(AsyncIsolatedTestCase):
             self.assertEqual(manager.collect(), [])
             self.assertFalse(manager.has_running())
             self.assertIn("[tools] 主 Agent: 1；子 Agent: 3；合计: 4",
-                [call.args[0] for call in printed.call_args_list if call.args])
+                [re.sub(r"\x1b\[[0-9;]*m", "", call.args[0])
+                 for call in printed.call_args_list if call.args])
         finally:
             release.set()
             self.assertEqual(await asyncio.to_thread(manager.shutdown, timeout_seconds=2), [])
@@ -391,7 +395,8 @@ class AsyncMainTests(AsyncIsolatedTestCase):
             AsyncConsole=Mock(return_value=SimpleNamespace(read=reader)),
             anthropic=SimpleNamespace(AsyncAnthropic=Mock(return_value=ClientContext())),
             os=SimpleNamespace(getenv=lambda name: None, getcwd=lambda: str(self.workdir)),
-            signal=signal, patch_stdout=nullcontext,
+            signal=signal,
+            patch_stdout=Mock(side_effect=lambda *, raw=False: nullcontext()),
             cleanup_program_async=AsyncMock(side_effect=cleanup),
             async_agent_loop=agent_loop or AsyncMock(),
         )

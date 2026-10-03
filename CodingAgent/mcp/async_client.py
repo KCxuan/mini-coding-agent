@@ -4,16 +4,19 @@ from contextlib import asynccontextmanager
 
 from mcp import Client
 
-from ..async_support import finish_task
+from ..async_support import finish_task, run_sync
 from .client import MCPClient
 from .config import MCPServerConfig
+from pathlib import Path
+
 
 class AsyncMCPClient(MCPClient):
-    def __init__(self, config: MCPServerConfig):
+    def __init__(self, config: MCPServerConfig, image_dir: Path | None = None):
         # 不调用旧构造函数，不创建或接收 AsyncBridge。
         self.config = config
         self.name = config.name
         self.transport_kind = config.transport_kind
+        self.image_dir = image_dir
 
         self.tools = []
         self._session = None
@@ -148,7 +151,7 @@ class AsyncMCPClient(MCPClient):
                 session.call_tool(tool_name, args or {}),
                 timeout=timeout,
             )
-            return self._format_mcp_tool_result(result)
+            return await run_sync(self._format_mcp_tool_result, result)
 
         except TimeoutError:
             return (

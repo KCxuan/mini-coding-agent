@@ -8,8 +8,18 @@ from copy import deepcopy
 from .context_budget import (
     COMPACT_TRIGGER_RATIO,
     ContextBudgetError,
+    MAX_IMAGES_PER_REQUEST,
+    MAX_REQUEST_BODY_BYTES,
     dump_json,
+    estimate_request_bytes,
     estimate_request_tokens,
+)
+from .images import (
+    has_images,
+    image_count,
+    text_history,
+    tool_result_text,
+    without_image_data,
 )
 
 class ContextCompactor:
@@ -94,17 +104,24 @@ class ContextCompactor:
         }
     
     def write_transcript(self, messages: list[dict]) -> Path:
-        """Write a transcript of the messages to a file."""
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         path = self.transcript_dir / f"transcript_{uuid4().hex}.jsonl"
+
         with path.open("x", encoding="utf-8") as transcript:
-            for message in messages:
-                transcript.write(json.dumps(message, default=str,ensure_ascii=False) + "\n")
+            for message in text_history(messages):
+                transcript.write(dump_json(message) + "\n")
+
         return path
     
     def split_recent_history(self, messages: list) -> tuple[list, list]:
         """保留最近至少 KEEP_RECENT_MESSAGES 条，并避开工具交互中间。"""
         desired = max(0, len(messages) - self.KEEP_RECENT_MESSAGES)
+
+        # 最新助手响应之后的工具结果，尚未进入下一次模型请求。
+        unseen = self.unseen_tool_result_positions(messages)
+        if unseen:
+            desired = min(desired, min(message_index for message_index, _ in unseen))
+
         split_at = 0
         pending = set()
 
@@ -231,26 +248,64 @@ class ContextCompactor:
             return output
         return self.persisted_preview(tool_use_id, output)
 
-    def tool_result_budget(self, messages: list, max_chars: int | None = None) -> list:
+    def tool_result_budget(
+        self,
+        messages: list,
+        max_chars: int | None = None,
+    ) -> list:
         """当最近一批user消息中工具总字符超过限制（TOOL_RESULT_BATCH_CHAR_LIMIT）时，
         将部分大型工具的结果（超过LARGE_RESULT_CHAR_LIMIT）保存到文件中。"""
         if not messages:
             return messages
+
         content = messages[-1].get("content")
         if messages[-1].get("role") != "user" or not isinstance(content, list):
             return messages
-        blocks = [block for block in content
-                  if isinstance(block, dict) and block.get("type") == "tool_result"]
-        limit = max_chars or self.TOOL_RESULT_BATCH_CHAR_LIMIT
-        total = sum(len(str(block.get("content", ""))) for block in blocks)
-        for block in sorted(blocks, key=lambda item: len(str(item.get("content", ""))), reverse=True):
+
+        blocks = [
+            block for block in content
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        limit = (
+            self.TOOL_RESULT_BATCH_CHAR_LIMIT
+            if max_chars is None
+            else max_chars
+        )
+
+        def text_size(block):
+            return len(tool_result_text(block.get("content", "")))
+
+        total = sum(text_size(block) for block in blocks)
+
+        for block in sorted(blocks, key=text_size, reverse=True):
             if total <= limit:
                 break
-            output = str(block.get("content", ""))
-            if len(output) <= self.LARGE_RESULT_CHAR_LIMIT:
-                continue
-            block["content"] = self.persist_large_output(block.get("tool_use_id", "unknown"), output)
-            total = sum(len(str(item.get("content", ""))) for item in blocks)
+
+            output = block.get("content", "")
+            tool_id = block.get("tool_use_id", "unknown")
+
+            if has_images(output):
+                # 不将整个列表转成字符串；只处理过长的文字块。
+                for index, part in enumerate(output):
+                    if part.get("type") != "text":
+                        continue
+
+                    text = str(part.get("text") or "")
+                    if len(text) > self.LARGE_RESULT_CHAR_LIMIT:
+                        part["text"] = self.persist_large_output(
+                            f"{tool_id}_text_{index}",
+                            text,
+                        )
+            else:
+                text = tool_result_text(output)
+                if len(text) > self.LARGE_RESULT_CHAR_LIMIT:
+                    block["content"] = self.persist_large_output(
+                        tool_id,
+                        text,
+                    )
+
+            total = sum(text_size(item) for item in blocks)
+
         return messages
 
 
@@ -289,26 +344,32 @@ class ContextCompactor:
             if should_stop is not None and should_stop(messages):
                 break
 
-            output = str(block.get("content", ""))
+            output = block.get("content", "")
 
-            if len(output) <= 500:
+            if has_images(output):
+                block["content"] = without_image_data(output)
+                continue
+
+            text = tool_result_text(output)
+
+            if len(text) <= 500:
                 continue
 
             replacement = self.persisted_preview(
                 block.get("tool_use_id", "unknown"),
-                output,
+                text,
                 preview_chars=500,
             )
 
             # 加上路径和提示后仍然更短，才替换。
-            if len(replacement) < len(output):
+            if len(replacement) < len(text):
                 block["content"] = replacement
 
         return messages
 
 
     def summary_input(self, messages: list) -> str:
-        conversation = dump_json(messages)
+        conversation = dump_json(text_history(messages))
 
         estimated = estimate_request_tokens(
             self.SUMMARY_SYSTEM_PROMPT,
@@ -396,8 +457,16 @@ class ContextCompactor:
             *recent_history,
         ]
 
-        if self.estimate_chars(candidate) >= self.estimate_chars(messages):
-            raise RuntimeError("摘要没有缩短历史，原历史未替换")
+        before_tokens = estimate_request_tokens("", messages, [])
+        after_tokens = estimate_request_tokens("", candidate, [])
+
+        before_bytes = estimate_request_bytes("", messages, [])
+        after_bytes = estimate_request_bytes("", candidate, [])
+
+        if after_tokens >= before_tokens and after_bytes >= before_bytes:
+            raise RuntimeError(
+                "摘要没有减少 token 或请求体大小，原历史未替换"
+            )
 
         return candidate
 
@@ -420,22 +489,35 @@ class ContextCompactor:
         tools,
         output_reserve,
     ):
-        limit = int(
+        token_limit = int(
             self.context_window_tokens * self.compact_trigger_ratio
         )
+        body_limit = int(
+            MAX_REQUEST_BODY_BYTES * self.compact_trigger_ratio
+        )
 
-        if not 0 <= output_reserve < limit:
+        if not 0 <= output_reserve < token_limit:
             raise ContextBudgetError(
                 "输出预留与上下文窗口配置不匹配"
             )
 
         def fits(current):
-            estimated = estimate_request_tokens(
+            tokens = estimate_request_tokens(
                 system_prompt,
                 current,
                 tools,
             )
-            return estimated + output_reserve < limit
+            body_bytes = estimate_request_bytes(
+                system_prompt,
+                current,
+                tools,
+            )
+
+            return (
+                tokens + output_reserve < token_limit
+                and body_bytes < body_limit
+                and image_count(current) <= MAX_IMAGES_PER_REQUEST
+            )
 
         # 在副本上处理，失败时不覆盖调用方历史。
         candidate = deepcopy(messages)

@@ -3,14 +3,16 @@ import asyncio
 from .async_client import AsyncMCPClient
 from .manager import MCPManager
 from .config import MCPServerConfig
+from pathlib import Path
 
 
 class AsyncMCPManager(MCPManager):
-    def __init__(self, configs: dict[str, MCPServerConfig], *, host_policy):
+    def __init__(self, configs: dict[str, MCPServerConfig], *, host_policy, image_dir: Path | None = None):
         # 复用旧管理器的工具池、命名检查和策略查询逻辑。
         # 不创建 AsyncBridge。
         self.configs = configs
         self.host_policy = host_policy
+        self.image_dir = image_dir
 
         self.clients: dict[str, AsyncMCPClient] = {}
         self.tool_policies: dict[str, str] = {}
@@ -44,7 +46,7 @@ class AsyncMCPManager(MCPManager):
                 await existing.disconnect()
                 self.clients.pop(name, None)
 
-            server = AsyncMCPClient(config)
+            server = AsyncMCPClient(config, image_dir=self.image_dir)
 
             # connect() 自身负责失败、超时、取消后的清理。
             tools = await server.connect()

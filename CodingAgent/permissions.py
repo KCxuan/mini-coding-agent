@@ -66,7 +66,7 @@ class PermissionManager:
 
         self.rules = [
             {
-                "tools": ["read_file", "write_file", "edit_file"],
+                "tools": ["read_file", "write_file", "edit_file", "read_image"],
                 "check": lambda args: not (
                     self.workdir / args.get("path", "")
                 ).resolve().is_relative_to(self.workdir),
@@ -104,7 +104,7 @@ class PermissionManager:
                 print(f"\n\033[31m⛔ {reason}\033[0m")
                 return reason
         
-        if block.name == "bash" or block.name in ["read_file", "write_file", "edit_file"]:
+        if block.name == "bash" or block.name in ["read_file", "write_file", "edit_file", "read_image"]:
             """
             检查命令是否在权限规则PERMISSION_RULES中,
             如果包含，则返回拒绝原因

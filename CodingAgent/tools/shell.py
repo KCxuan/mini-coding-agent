@@ -112,6 +112,7 @@ class ShellRunner:
         kwargs: dict = {
             "shell": True,
             "cwd": self.workdir,
+            "stdin": subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
             "text": True,

@@ -206,7 +206,7 @@ class CompactTests(IsolatedTestCase):
         self.client.responses.append(text_response("summary" * 20000))
         messages = self.history(count=4, output="x" * 300)
         before = copy.deepcopy(messages)
-        with self.assertRaisesRegex(RuntimeError, "没有缩短"):
+        with self.assertRaisesRegex(RuntimeError, "摘要没有减少 token 或请求体大小"):
             self.compactor.compact_history(messages, "Read")
         self.assertEqual(messages, before)
 

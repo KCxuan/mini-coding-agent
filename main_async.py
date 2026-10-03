@@ -83,7 +83,7 @@ from CodingAgent.async_support import (
     run_sync,
 )
 from CodingAgent.mcp.async_manager import AsyncMCPManager
-
+from CodingAgent.images import tool_result_preview
 # ----------------------------------------------------
 
 dotenv.load_dotenv()
@@ -164,6 +164,7 @@ MCP_BRIDGE = AsyncBridge()
 MCP_MANAGER = AsyncMCPManager(
     MCP_CONFIG,
     host_policy=MCP_HOST_POLICY,
+    image_dir=TOOL_RESULTS_DIR / "images",
 )
 
 # --------------------------------------------------
@@ -283,6 +284,7 @@ TOOL_HANDLERS = {
     "edit_file": FILES.run_edit_file,
     "glob": FILES.run_glob,
     "grep": FILES.run_grep,
+    "read_image": FILES.run_read_image,
     "load_skill": SKILL_LOADER.load,
 
     "create_task": TASK_BOARD.run_create_task,
@@ -654,8 +656,8 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
                         subagent_tool_counts.setdefault(run_id, 0)
 
             
-            suffix = "... [terminal preview truncated]" if len(tool_result) > 500 else ""
-            print(f"\033[32mTool result: {tool_result[:500]}{suffix}\033[0m")
+            preview = tool_result_preview(tool_result)
+            print(f"\033[32mTool result: {preview}\033[0m")
             results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_call.id,

@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from ..images import ToolContent, read_image
 
 class FileTools:
     def __init__(self, workdir: Path):
@@ -267,3 +268,10 @@ class FileTools:
 
         except (OSError, ValueError, RuntimeError) as error:
             return f"Error: {error}"
+
+    def run_read_image(self, path: str) -> ToolContent:
+        """读取工作目录内的图片，返回视觉输入内容"""
+        try:
+            return read_image(self.safe_path(path))
+        except Exception as e:
+            return f"Error: {e}"

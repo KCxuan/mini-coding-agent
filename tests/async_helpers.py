@@ -16,7 +16,37 @@ class AsyncIsolatedTestCase(IsolatedTestCase, unittest.IsolatedAsyncioTestCase):
             "Async test attempted blocking terminal input")))
 
 
+class _AsyncScriptedStream:
+    """模拟 SDK 的流式上下文；请求记录仍由原客户端维护。"""
+
+    def __init__(self, client, kwargs):
+        self.client = client
+        self.kwargs = kwargs
+        self.response = None
+
+    async def __aenter__(self):
+        self.response = await self.client.create(**self.kwargs)
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    @property
+    def text_stream(self):
+        async def chunks():
+            for block in self.response.content or []:
+                if getattr(block, "type", None) == "text":
+                    yield block.text
+        return chunks()
+
+    async def get_final_message(self):
+        return self.response
+
+
 class AsyncScriptedClient(ScriptedClient):
+    def stream(self, **kwargs):
+        return _AsyncScriptedStream(self, kwargs)
+
     async def create(self, **kwargs):
         # 模拟模型请求让出事件循环；保留请求快照和意外多请求检查。
         await asyncio.sleep(0)

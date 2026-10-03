@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from CodingAgent.background import BackgroundManager
 from CodingAgent.hooks import HookRegistry
+from CodingAgent.images import tool_result_preview
 from CodingAgent.tools.dispatcher import ToolDispatcher
 from CodingAgent.tools.files import FileTools
 from CodingAgent.tools.shell import ShellRunner
@@ -166,6 +167,7 @@ class MainLoopTests(IsolatedTestCase):
             "CONFIG": SimpleNamespace(context_window_tokens=1_000_000),
             "ContextBudgetError": ContextBudgetError,
             "estimate_request_tokens": estimate_request_tokens,
+            "tool_result_preview": tool_result_preview,
             "input": Mock(side_effect=AssertionError("Unexpected interactive prompt")),
             "BACKGROUND": background, "SUBAGENTS": subagents,
             "SUBAGENT_TOOLS": subagent_tools, "MEMORY_MANAGER": memory,

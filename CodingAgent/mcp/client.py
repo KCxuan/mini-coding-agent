@@ -4,6 +4,15 @@ import asyncio
 import json
 import threading
 from typing import Any
+from pathlib import Path
+
+from ..images import (
+    ToolContent,
+    has_images,
+    make_image_content,
+    save_image,
+    tool_result_text,
+)
 
 from mcp import Client, StdioServerParameters
 
@@ -22,8 +31,9 @@ def _schema_to_dict(schema: Any) -> dict:
     return {"type": "object", "properties": {}}
 
 class MCPClient:
-    def __init__(self, config: MCPServerConfig, bridge: AsyncBridge):
+    def __init__(self, config: MCPServerConfig, bridge: AsyncBridge, *, image_dir: Path | None = None):
         self.config = config
+        self.image_dir = image_dir
         self.name = config.name
         self.transport_kind = config.transport_kind
         self.tools: list[dict] = []
@@ -143,7 +153,7 @@ class MCPClient:
             self._session_future = None
         self.tools = []
 
-    def call_tool(self, tool_name: str, args: dict | None = None, timeout: float = 120.0) -> str:
+    def call_tool(self, tool_name: str, args: dict | None = None, timeout: float = 120.0) -> ToolContent:
         if self._session is None:
             return f"MCP error: server {self.name!r} is not connected"
         try:
@@ -160,22 +170,45 @@ class MCPClient:
         except Exception as error:
             return f"MCP error: {type(error).__name__}: {error}"
 
-    def _format_mcp_tool_result(self, result: Any) -> str:
-        """把 SDK 的 CallToolResult 收成一段给模型看的文字。"""
+    def _format_mcp_tool_result(self, result: Any) -> ToolContent:
         is_error = bool(getattr(result, "is_error", False))
-        texts: list[str] = []
+        parts: list[dict] = []
+
         for block in getattr(result, "content", None) or []:
-            if getattr(block, "type", None) == "text":
+            block_type = getattr(block, "type", None)
+
+            if block_type == "text":
                 text = getattr(block, "text", "")
                 if text:
-                    texts.append(str(text))
-        body = "\n".join(texts).strip()
+                    parts.append({"type": "text", "text": str(text)})
+
+            elif block_type == "image":
+                if self.image_dir is None:
+                    raise ValueError("MCP image output directory is not configured")
+
+                data = getattr(block, "data", "")
+                media_type = (
+                    getattr(block, "mime_type", None)
+                    or getattr(block, "mimeType", None)
+                )
+                path = save_image(data, media_type, self.image_dir)
+                parts.extend(make_image_content(path, data, media_type))
+
+        if has_images(parts):
+            if is_error:
+                parts.insert(0, {
+                    "type": "text",
+                    "text": "MCP error: tool returned an error.",
+                })
+            return parts
+
+        body = tool_result_text(parts).strip() if parts else ""
         if not body:
             structured = getattr(result, "structured_content", None)
             if structured is not None:
                 body = json.dumps(structured, ensure_ascii=False)
+
         if not body:
             body = "(empty MCP tool result)"
-        if is_error:
-            return f"MCP error: {body}"
-        return body
+
+        return f"MCP error: {body}" if is_error else body

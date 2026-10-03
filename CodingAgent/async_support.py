@@ -8,6 +8,7 @@ from prompt_toolkit import PromptSession
 from .background import should_run_background
 from .hooks import HookRegistry
 from .permissions import PermissionManager, check_deny_list
+from .images import normalize_tool_result
 
 
 async def finish_task(task):
@@ -124,6 +125,7 @@ class AsyncPermissionManager(PermissionManager):
             "read_file",
             "write_file",
             "edit_file",
+            "read_image",
         }:
             reason = self.check_rules(
                 block.name,
@@ -162,6 +164,7 @@ class AsyncToolDispatcher:
         "glob",
         "grep",
         "load_skill",
+        "read_image",
     }
 
     def __init__(self, hooks, background):
@@ -225,4 +228,4 @@ class AsyncToolDispatcher:
             tool_call,
             output,
         )
-        return str(output)
+        return normalize_tool_result(output)

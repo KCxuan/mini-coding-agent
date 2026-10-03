@@ -1,7 +1,14 @@
 import json
 
+from .images import image_count, text_history
+
 
 COMPACT_TRIGGER_RATIO = 0.90
+
+# 这些值针对当前 DeepSeek Flash 接口。
+IMAGE_TOKEN_BUDGET = 1024
+MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
+MAX_IMAGES_PER_REQUEST = 600
 
 
 class ContextBudgetError(RuntimeError):
@@ -10,10 +17,8 @@ class ContextBudgetError(RuntimeError):
 
 
 def json_default(value):
-    # 支持 Anthropic SDK 返回的内容块。
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
-
     raise TypeError(f"无法序列化：{type(value).__name__}")
 
 
@@ -26,17 +31,23 @@ def dump_json(value):
     )
 
 
-def estimate_request_tokens(system_prompt, messages, tools):
-    """粗估完整文本请求，包括消息中的思考和工具内容。"""
-    request_text = dump_json({
+def request_payload(system_prompt, messages, tools):
+    return {
         "system": system_prompt,
         "messages": messages,
         "tools": tools,
-    })
+    }
 
-    # 使用整数计算：这里 10 个单位代表约 1 token。
+
+def estimate_request_tokens(system_prompt, messages, tools):
+    """文字沿用原估算；图片按单张上限单独预留。"""
+    request_text = dump_json(request_payload(
+        system_prompt,
+        text_history(messages),
+        tools,
+    ))
+
     units = 0
-
     for char in request_text:
         if "\u4e00" <= char <= "\u9fff":
             units += 6
@@ -45,5 +56,11 @@ def estimate_request_tokens(system_prompt, messages, tools):
         else:
             units += 10
 
-    # 向上取整。
-    return (units + 9) // 10
+    text_tokens = (units + 9) // 10
+    return text_tokens + image_count(messages) * IMAGE_TOKEN_BUDGET
+
+
+def estimate_request_bytes(system_prompt, messages, tools):
+    """请求体大小包含实际 Base64，不能使用文字摘要副本。"""
+    payload = request_payload(system_prompt, messages, tools)
+    return len(dump_json(payload).encode("utf-8"))

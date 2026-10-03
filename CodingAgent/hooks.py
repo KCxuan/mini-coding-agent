@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from pathlib import Path
+from .images import tool_result_text
 
 
 class HookRegistry:
@@ -37,7 +38,7 @@ class DefaultHooks:
 
     # PostToolUse: 大文件提醒
     def large_output_hook(self, block, output):
-        if len(str(output)) > 100000:
+        if len(tool_result_text(output)) > 100000:
             print(f"\033[33m[HOOK] ⚠ Large output from {block.name}\033[0m")
 
     # Stop: 退出总结实际调用工具的次数
