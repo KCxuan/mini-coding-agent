@@ -684,7 +684,7 @@ async def async_agent_loop(messages: list[dict], active_request: str, *, llm, co
         })
         if compact_requested:
             messages[:] = await run_sync(
-                COMPACTOR.reactive_compact,
+                COMPACTOR.compact_history,
                 messages,
                 active_request,
             )

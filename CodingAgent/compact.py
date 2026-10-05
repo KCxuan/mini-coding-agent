@@ -474,7 +474,7 @@ class ContextCompactor:
         candidate = self.compact_history(messages, active_request)
 
         if candidate is messages:
-            raise RuntimeError(
+            raise ContextBudgetError(
                 "上下文已超限，但没有可总结的旧历史"
             )
 
